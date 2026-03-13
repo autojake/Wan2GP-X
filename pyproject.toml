@@ -63,6 +63,7 @@ dependencies = [
     "peft==0.17.0",
     "matplotlib",
     "gguf==0.17.1",
+    "flash-linear-attention==0.4.1",
     "ftfy",
     "piexif",
     "nvidia-ml-py",
