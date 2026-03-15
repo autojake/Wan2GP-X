@@ -1,0 +1,55 @@
+name: Sync Upstream (Mirror & Merge)
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Daily at midnight
+  workflow_dispatch:   # Manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update Mirror Branch
+        run: |
+          git remote add upstream https://github.com/deepbeepmeep/Wan2GP.git
+          git fetch upstream
+          
+          # Force the 'upstream-main' branch to exactly match the author's main
+          # This keeps a clean, un-customized copy of their code in your repo
+          git push origin upstream/main:refs/heads/upstream-main --force
+
+      - name: Merge into Main
+        run: |
+          git checkout main
+          
+          # Attempt to merge the mirror into our customized main
+          if ! git merge origin/upstream-main --no-edit; then
+            echo "Conflict detected during merge. Applying protections..."
+            
+            # Protect specific files from being overwritten by upstream
+            git checkout --ours README.md
+            git checkout --ours uv.lock
+            git checkout --ours pyproject.toml
+            git checkout --ours DGXSPARK.md
+            
+            # Add the protected files and complete the merge
+            git add README.md uv.lock pyproject.toml DGXSPARK.md
+            git commit --no-edit || echo "Merge resolved with no changes"
+          fi
+
+      - name: Push Changes
+        run: git push origin main
