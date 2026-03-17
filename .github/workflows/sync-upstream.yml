@@ -32,23 +32,38 @@ jobs:
           # This keeps a clean, un-customized copy of their code in your repo
           git push origin upstream/main:refs/heads/upstream-main --force
 
-      - name: Merge into Main
+      - name: Merge Upstream into Main
         run: |
           git checkout main
-          
-          # Attempt to merge the mirror into our customized main
+          # Ensure local main matches remote before merging (prevents non-fast-forward push)
+          git reset --hard origin/main
+
+          # Save our versions of protected files before the merge
+          for f in README.md uv.lock pyproject.toml DGXSPARK.md; do
+            git show HEAD:"$f" > "/tmp/${f}.ours" 2>/dev/null || true
+          done
+
+          # Merge upstream; on conflict, take upstream's version for everything
+          # (protected files are restored unconditionally below)
           if ! git merge origin/upstream-main --no-edit; then
-            echo "Conflict detected during merge. Applying protections..."
-            
-            # Protect specific files from being overwritten by upstream
-            git checkout --ours README.md
-            git checkout --ours uv.lock
-            git checkout --ours pyproject.toml
-            git checkout --ours DGXSPARK.md
-            
-            # Add the protected files and complete the merge
+            echo "Conflicts detected, auto-resolving in favor of upstream..."
+            git checkout --theirs -- $(git diff --name-only --diff-filter=U)
+            git add -A
+            git commit --no-edit
+          fi
+
+          # Always restore our protected files regardless of whether there was a conflict
+          changed=false
+          for f in README.md uv.lock pyproject.toml DGXSPARK.md; do
+            if [ -f "/tmp/${f}.ours" ] && ! diff -q "/tmp/${f}.ours" "$f" >/dev/null 2>&1; then
+              cp "/tmp/${f}.ours" "$f"
+              changed=true
+            fi
+          done
+
+          if [ "$changed" = true ]; then
             git add README.md uv.lock pyproject.toml DGXSPARK.md
-            git commit --no-edit || echo "Merge resolved with no changes"
+            git commit -m "chore: restore protected files after upstream sync"
           fi
 
       - name: Push Changes
