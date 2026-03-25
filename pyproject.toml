@@ -39,6 +39,7 @@ dependencies = [
     "spacy-pkuseg",
     "spacy",
     "gradio-rangeslider",
+    "markdown",
     "opencv-python>=4.12.0.88",
     "segment-anything",
     "rembg==2.0.65",
