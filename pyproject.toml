@@ -43,8 +43,11 @@ dependencies = [
     "opencv-python>=4.12.0.88",
     "segment-anything",
     "rembg==2.0.65",
-    "decord2==3.0.0",
-    "onnxruntime",
+    "decord ; sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "decord2==3.0.0 ; sys_platform != 'win32' or platform_machine != 'AMD64'",
+    "onnxruntime-gpu==1.22.0 ; python_version < '3.11' and platform_machine != 'aarch64'",
+    "onnxruntime-gpu==1.25.0.dev20260210001 ; python_version >= '3.11' and platform_machine != 'aarch64'",
+    "onnxruntime ; platform_machine == 'aarch64'",
     "timm",
     "insightface==0.7.3 ; sys_platform == 'linux' and platform_machine != 'aarch64'",
     "insightface @ https://github.com/deepbeepmeep/insightface/releases/download/insightface/insightface-0.7.3-cp310-cp310-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.10'",
@@ -77,21 +80,33 @@ dependencies = [
     "wetext==0.1.2",
     "torch",
     "torchvision",
-    "torchaudio"
+    "torchaudio",
+    "triton-windows ; sys_platform == 'win32'",
+    "triton ; sys_platform != 'win32' and platform_machine != 'aarch64'",
 ]
 
 [project.optional-dependencies]
 dgx-spark = []
 
 [tool.uv]
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
+[[tool.uv.index]]
+name = "ort-cuda-13-nightly"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/"
+explicit = true
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
-torchcodec = { index = "pytorch-cu130" }
+onnxruntime-gpu = { index = "ort-cuda-13-nightly" }
