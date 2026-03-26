@@ -52,3 +52,6 @@ settings/
 wgp_config.json
 plugins_local.json
 loras_url_cache.json
+wheels/
+
+Light*
