@@ -36,6 +36,6 @@ cd Wan2GP-X
 
 ## Start Wan2GP
 
-```
-uv run python wgp.py
-```
+- DGX Spark: `uv run gb10-wgp.py`
+- Bugfix monkeypatches: `uv run wgp-x.py`
+- Vanilla: `uv run wgp.py`
