@@ -32,6 +32,17 @@ class _MemCapProxy:
 
 torch.cuda.get_device_properties = lambda dev: _MemCapProxy(_real_gdp(dev))
 
+# sage2_core.py dispatches on arch string but has no sm121 branch (added sm120, missed sm121).
+# Alias sm121 -> sm120 so the sm120 kernel path is used. The compiled .so has sm_120a cubins
+# plus PTX (built with 12.0+PTX) so the driver JIT covers sm121.
+try:
+    import shared.sage2_core as _sage2
+    _sage2._CUDA_ARCHS = tuple("sm120" if a == "sm121" else a for a in _sage2._CUDA_ARCHS)
+    _real_get_arch = _sage2._get_cuda_arch
+    _sage2._get_cuda_arch = lambda dev: "sm120" if _real_get_arch(dev) == "sm121" else _real_get_arch(dev)
+except ImportError:
+    pass
+
 if __name__ == "__main__":
     import runpy
     runpy.run_path("wgp.py", init_globals={"__name__": "__main__"}, run_name="__main__")

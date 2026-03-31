@@ -39,7 +39,7 @@ jobs:
           git reset --hard origin/main
 
           # Save our versions of protected files before the merge
-          for f in README.md uv.lock pyproject.toml DGXSPARK.md; do
+          for f in README.md uv.lock pyproject.toml DGXSPARK.md .gitignore; do
             git show HEAD:"$f" > "/tmp/${f}.ours" 2>/dev/null || true
           done
 
@@ -54,7 +54,7 @@ jobs:
 
           # Always restore our protected files regardless of whether there was a conflict
           changed=false
-          for f in README.md uv.lock pyproject.toml DGXSPARK.md; do
+          for f in README.md uv.lock pyproject.toml DGXSPARK.md .gitignore; do
             if [ -f "/tmp/${f}.ours" ] && ! diff -q "/tmp/${f}.ours" "$f" >/dev/null 2>&1; then
               cp "/tmp/${f}.ours" "$f"
               changed=true
@@ -62,7 +62,7 @@ jobs:
           done
 
           if [ "$changed" = true ]; then
-            git add README.md uv.lock pyproject.toml DGXSPARK.md
+            git add README.md uv.lock pyproject.toml DGXSPARK.md .gitignore
             git commit -m "chore: restore protected files after upstream sync"
           fi
 

@@ -24,6 +24,9 @@
 *.pdf
 *.whl
 *.exe
+loras
+ckpts
+outputs
 cache
 __pycache__/
 storage/
