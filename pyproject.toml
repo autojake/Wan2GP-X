@@ -83,6 +83,7 @@ dependencies = [
     "torchaudio",
     "triton-windows ; sys_platform == 'win32'",
     "triton ; sys_platform != 'win32' and platform_machine != 'aarch64'",
+    "openai-whisper",
 ]
 
 [project.optional-dependencies]
