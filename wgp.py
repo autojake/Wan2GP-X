@@ -40,7 +40,7 @@ import importlib
 from shared.utils import notification_sound
 from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_loras_multipliers
 from shared.utils.utils import convert_tensor_to_image, save_image, get_video_info, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, to_rgb_tensor
-from shared.utils.utils import calculate_new_dimensions, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
+from shared.utils.utils import calculate_new_dimensions, get_outpainting_dims, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension
 from shared.utils.audio_video import extract_audio_tracks, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_pair_volumes_to_temp_files, save_video, save_image
 from shared.utils.audio_video import read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension
@@ -117,7 +117,7 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.6"
-WanGP_version = "11.25"
+WanGP_version = "11.26"
 settings_version = 2.56
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -5433,17 +5433,6 @@ def enhance_prompt(state, prompt, prompt_enhancer, multi_images_gen_type, multi_
         gr.Info(f'Prompt "{original_prompts[0][:100]}" has been enhanced')
     return prompt, prompt
 
-def get_outpainting_dims(video_guide_outpainting, video_guide_outpainting_ratio = ""):
-    if video_guide_outpainting is None:
-        return None
-    video_guide_outpainting = str(video_guide_outpainting).strip()
-    if video_guide_outpainting.startswith("#"):
-        return None
-    if len(video_guide_outpainting) == 0 or video_guide_outpainting == "0 0 0 0":
-        return [0, 0, 0, 0] if len((video_guide_outpainting_ratio or "").strip()) > 0 else None
-    outpainting_dims = video_guide_outpainting.split(" ")
-    return None if len(outpainting_dims) != 4 else [int(v) for v in outpainting_dims]
-
 def parse_guide_inpaint_color(value):
     if isinstance(value, str):
         cleaned = value.strip()
@@ -7978,9 +7967,7 @@ def prepare_inputs_dict(target, inputs, model_type = None, model_filename = None
         pop += ["motion_amplitude"]
 
     if model_def.get("video_guide_outpainting", None) is None:
-        pop += ["video_guide_outpainting"] 
-    if model_def.get("video_guide_outpainting_ratio", None) is None:
-        pop += ["video_guide_outpainting_ratio"] 
+        pop += ["video_guide_outpainting", "video_guide_outpainting_ratio"] 
 
     if not (vace or t2v):
         pop += ["min_frames_if_references"]
@@ -8819,6 +8806,8 @@ def change_model(state, model_choice):
         writer.write(json.dumps(server_config, indent=4))
 
     state["model_type"] = model_choice
+    if hasattr(app, "plugin_manager"):
+        app.plugin_manager.notify_model_change(state, model_choice)
     description, header = generate_header(model_choice, compile=compile, attention_mode=attention_mode)
     
     return description, header
@@ -9965,7 +9954,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                         outpainting_label_suffix = "%" if len(video_guide_outpainting_ratio_value) == 0 else "x"
                         with gr.Row():
                             video_guide_outpainting_checkbox = gr.Checkbox(label=model_def.get("video_guide_outpainting_label", "Enable Spatial Outpainting on Control Video, Landscape or Positioned Reference Frames") if image_mode_value == 0 else "Enable Spatial Outpainting on Control Image", value=video_guide_outpainting_enabled, scale=3)
-                            video_guide_outpainting_ratio = gr.Dropdown([("Manual Expansion", ""), ("Fit into a 1:1 Box", "1:1"), ("Fit into a 4:3 Box", "4:3"), ("Fit into a 3:4 Box", "3:4"), ("Fit into a 16:9 Box", "16:9"), ("Fit into a 9:16 Box", "9:16"), ("Fit into a 2:1 Box", "2:1"), ("Fit into a 1:2 Box", "1:2")], value=video_guide_outpainting_ratio_value, visible=video_guide_outpainting_enabled, show_label=False, allow_custom_value=False, scale=1)
+                            video_guide_outpainting_ratio = gr.Dropdown([("Manual Expansion", ""), ("Fit into a 1:1 Box", "1:1"), ("Fit into a 4:3 Box", "4:3"), ("Fit into a 3:4 Box", "3:4"), ("Fit into a 16:9 Box", "16:9"), ("Fit into a 9:16 Box", "9:16"), ("Fit into a 21:9 Box", "21:9"), ("Fit into a 9:21 Box", "9:21")], value=video_guide_outpainting_ratio_value, visible=video_guide_outpainting_enabled, show_label=False, allow_custom_value=False, scale=1)
                         with gr.Row(visible = not video_guide_outpainting_value.startswith("#")) as video_guide_outpainting_row:
                             video_guide_outpainting_value = video_guide_outpainting_value[1:] if video_guide_outpainting_value.startswith("#") else video_guide_outpainting_value
                             video_guide_outpainting_list = [0] * 4 if len(video_guide_outpainting_value) == 0 else [int(v) for v in video_guide_outpainting_value.split(" ")]

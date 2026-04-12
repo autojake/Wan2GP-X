@@ -189,7 +189,6 @@ class family_handler:
         
         if distilled and base_model_type in ["ltx2_22B"]:
             extra_model_def["video_guide_outpainting"] = [0,1]
-            extra_model_def["video_guide_outpainting_ratio"] = [0,1]
             extra_model_def["video_guide_outpainting_label"] = "Enable Spatial Outpainting on Control Video using Ic Lora Outpaint"
             extra_model_def["guide_inpaint_color"] = 0
 
@@ -386,6 +385,8 @@ class family_handler:
                     return "LTX2 outpainting on Control Video is not compatible with the ID-LoRA option."
                 if "F" in video_prompt_type :
                     return "LTX2 outpainting is not yet compatible with Inject Frames."
+                if "A" in video_prompt_type :
+                    return "LTX2 outpainting doesnt support Video Mask."
 
         if "A" in audio_prompt_type and inputs.get("audio_guide") is None:
             audio_source = inputs.get("audio_source")
