@@ -1,14 +1,14 @@
 ############# WanGP Copyright DeepBeepMeep 2025-2026 #############
 import os, sys
 os.environ["GRADIO_LANG"] = "en"
+p = os.path.dirname(os.path.abspath(__file__))
+if p not in sys.path:
+    sys.path.insert(0, p)
 from shared.default_device import set_default_cuda_device_from_arg; set_default_cuda_device_from_arg("gpu")
 # # os.environ.pop("TORCH_LOGS", None)  # make sure no env var is suppressing/overriding
 # os.environ["TORCH_LOGS"]= "recompiles"
 import torch._logging as tlog
-# tlog.set_logs(recompiles=True, guards=True, graph_breaks=True)    
-p = os.path.dirname(os.path.abspath(__file__))
-if p not in sys.path:
-    sys.path.insert(0, p)
+# tlog.set_logs(recompiles=True, guards=True, graph_breaks=True)
 # from shared.utils.crash_diagnostics import install_wgp_crash_diagnostics; install_wgp_crash_diagnostics(__file__)
 # Ensure plugin-side `import wgp` resolves to this live module instance.
 if sys.modules.get("wgp") is not sys.modules.get(__name__):
@@ -2987,16 +2987,21 @@ def process_files_def(repoId = None, sourceFolderList = None, fileList = None, t
                         hf_hub_download(repo_id=repoId,  filename=onefile, local_dir = local_dir)
 
 
-def download_mmaudio():
+def query_mmaudio_download_def(enabled_only=True):
     mmaudio_enabled, mmaudio_mode, _, _, _ = get_mmaudio_settings(server_config)
-    if mmaudio_enabled:
-        mmaudio_files = ["synchformer_state_dict.pth", "v1-44.pth", MMAUDIO_STANDARD if mmaudio_mode == MMAUDIO_MODE_V2 else MMAUDIO_ALTERNATE]
-        bigvgan_v2_files = ["config.json", "bigvgan_generator.pt"]
-        enhancer_def = {
-            "repoId" : "DeepBeepMeep/Wan2.1",
-            "sourceFolderList" : [ "mmaudio", "DFN5B-CLIP-ViT-H-14-378", "bigvgan_v2_44khz_128band_512x"  ],
-            "fileList" : [ mmaudio_files, ["open_clip_config.json", "open_clip_pytorch_model.bin"], bigvgan_v2_files]
-        }
+    if enabled_only and not mmaudio_enabled:
+        return None
+    mmaudio_files = ["synchformer_state_dict.pth", "v1-44.pth", MMAUDIO_STANDARD if mmaudio_mode == MMAUDIO_MODE_V2 else MMAUDIO_ALTERNATE]
+    bigvgan_v2_files = ["config.json", "bigvgan_generator.pt"]
+    return {
+        "repoId" : "DeepBeepMeep/Wan2.1",
+        "sourceFolderList" : [ "mmaudio", "DFN5B-CLIP-ViT-H-14-378", "bigvgan_v2_44khz_128band_512x"  ],
+        "fileList" : [ mmaudio_files, ["open_clip_config.json", "open_clip_pytorch_model.bin"], bigvgan_v2_files]
+    }
+
+def download_mmaudio():
+    enhancer_def = query_mmaudio_download_def()
+    if enhancer_def is not None:
         process_files_def(**enhancer_def)
 
 
@@ -3026,6 +3031,27 @@ def download_file(url,filename):
 
 RIFE_V4_FILENAME = "rife4.26.pkl"
 RIFE_V3_FILENAME = "flownet.pkl"
+def query_core_shared_model_files():
+    depth_variant = server_config.get("depth_anything_v2_variant", "vitl")
+    depth_file = {"vitb": "depth_anything_v2_vitb.pth", "da3_metric_large": "depth_anything_v3_metric_large_bf16.safetensors"}.get(depth_variant, "depth_anything_v2_vitl.pth")
+    return {
+        "repoId" : "DeepBeepMeep/Wan2.1",
+        "sourceFolderList" : [ "pose", "scribble", "flow", "depth", "wav2vec", "chinese-wav2vec2-base", "roformer", "pyannote", "det_align", "" ],
+        "fileList" : [ ["dw-ll_ucoco_384.onnx", "yolox_l.onnx"],["netG_A_latest.pth"],  ["raft-things.pth"],
+                    [depth_file],
+                    ["config.json", "feature_extractor_config.json", "model.safetensors", "preprocessor_config.json", "special_tokens_map.json", "tokenizer_config.json", "vocab.json"],
+                    ["config.json", "pytorch_model.bin", "preprocessor_config.json"],
+                    ["model_bs_roformer_ep_317_sdr_12.9755.ckpt", "model_bs_roformer_ep_317_sdr_12.9755.yaml", "download_checks.json"],
+                    ["pyannote_model_wespeaker-voxceleb-resnet34-LM.bin", "pytorch_model_segmentation-3.0.bin"], ["detface.pt"], [ RIFE_V3_FILENAME if server_config.get("rife_version", "v3") == "v3" else RIFE_V4_FILENAME  ] ]
+    }
+
+def query_global_shared_model_files():
+    shared_defs = [query_core_shared_model_files(), query_matanyone_download_def(server_config)]
+    mmaudio_def = query_mmaudio_download_def(enabled_only=False)
+    if mmaudio_def is not None:
+        shared_defs.append(mmaudio_def)
+    return shared_defs
+
 download_shared_done = False
 def download_models(model_filename = None, model_type= None, file_type = 0, submodel_no = 1, force_path = None):
     def computeList(filename):
@@ -3037,19 +3063,7 @@ def download_models(model_filename = None, model_type= None, file_type = 0, subm
 
 
     if file_type == 0:
-        depth_variant = server_config.get("depth_anything_v2_variant", "vitl")
-        depth_file = {"vitb": "depth_anything_v2_vitb.pth", "da3_metric_large": "depth_anything_v3_metric_large_bf16.safetensors"}.get(depth_variant, "depth_anything_v2_vitl.pth")
-        shared_def = {
-            "repoId" : "DeepBeepMeep/Wan2.1",
-            "sourceFolderList" : [ "pose", "scribble", "flow", "depth", "wav2vec", "chinese-wav2vec2-base", "roformer", "pyannote", "det_align", "" ],
-            "fileList" : [ ["dw-ll_ucoco_384.onnx", "yolox_l.onnx"],["netG_A_latest.pth"],  ["raft-things.pth"], 
-                        [depth_file],
-                        ["config.json", "feature_extractor_config.json", "model.safetensors", "preprocessor_config.json", "special_tokens_map.json", "tokenizer_config.json", "vocab.json"],
-                        ["config.json", "pytorch_model.bin", "preprocessor_config.json"],
-                        ["model_bs_roformer_ep_317_sdr_12.9755.ckpt", "model_bs_roformer_ep_317_sdr_12.9755.yaml", "download_checks.json"],
-                        ["pyannote_model_wespeaker-voxceleb-resnet34-LM.bin", "pytorch_model_segmentation-3.0.bin"], ["detface.pt"], [ RIFE_V3_FILENAME if server_config.get("rife_version", "v3") == "v3" else RIFE_V4_FILENAME  ] ]
-        }
-        process_files_def(**shared_def)
+        process_files_def(**query_core_shared_model_files())
         process_files_def(**query_matanyone_download_def(server_config))
 
 
@@ -3900,7 +3914,7 @@ def finalize_generation(state):
     gen_in_progress = False
     gen["early_stop"] = False
     gen["early_stop_forwarded"] = False
-    return gallery_tabs, 1 if last_was_audio else 0, gr.update() if last_was_audio else gr.Gallery(selected_index=choice),  *pack_audio_gallery_state(audio_file_list, audio_choice), gr.Button(interactive=  True), gr.Button(interactive=  True, visible= False), gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.HTML(visible= False, value="")
+    return gallery_tabs, 1 if last_was_audio else 0, gr.update() if last_was_audio else gr.Gallery(value=gen.get("file_list", []), selected_index=choice),  *pack_audio_gallery_state(audio_file_list, audio_choice), gr.Button(interactive=  True), gr.Button(interactive=  True, visible= False), gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.HTML(visible= False, value="")
 
 def get_default_video_info():
     return "Please Select an Video / Image"    
@@ -6188,6 +6202,7 @@ def generate_video(
     original_prompts = prompts.copy()
     gen["sliding_window"] = sliding_window 
     while not abort: 
+        stop_current_sample = False
         extra_generation += gen.get("extra_orders",0)
         gen["extra_orders"] = 0
         total_generation = repeat_generation + extra_generation
@@ -6207,7 +6222,7 @@ def generate_video(
         context_scale = None
         window_no = 0
         extra_windows = 0
-        abort_scheduled = False
+        stop_sample_scheduled = False
         guide_start_frame = 0 # pos of of first control video frame of current window  (reuse_frames later than the first processed frame)
         keep_frames_parsed = [] # aligned to the first control frame of current window (therefore ignore previous reuse_frames)
         pre_video_guide = None # reuse_frames of previous window
@@ -6241,7 +6256,7 @@ def generate_video(
                 abort = gen.get("abort", False)
 
  
-        while not abort:
+        while not abort and not stop_current_sample:
             enable_RIFLEx = RIFLEx_setting == 0 and current_video_length > (6* get_model_fps(base_model_type)+1) or RIFLEx_setting == 1
             prompt =  prompts[window_no] if window_no < len(prompts) else prompts[-1]
             new_extra_windows = gen.get("extra_windows",0)
@@ -6530,7 +6545,7 @@ def generate_video(
                         break
                     elif src_video.shape[1] < current_video_length:
                         current_video_length = src_video.shape[1]
-                        abort_scheduled = True 
+                        stop_sample_scheduled = True 
                 if src_faces is not None:
                     if src_faces.shape[1] < src_video.shape[1]:
                         src_faces = torch.concat( [src_faces,  src_faces[:, -1:].repeat(1, src_video.shape[1] - src_faces.shape[1], 1,1)], dim =1)
@@ -6809,7 +6824,7 @@ def generate_video(
                 send_cmd("output")  
             else:
                 sample = samples.cpu()
-                abort = abort_scheduled or not (is_image or audio_only) and sample.shape[1] < current_video_length    
+                stop_current_sample = stop_sample_scheduled or (not (is_image or audio_only) and sample.shape[1] < current_video_length)
                 # if True: # for testing
                 #     torch.save(sample, "output.pt")
                 # else:
