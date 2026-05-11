@@ -1,3 +1,6 @@
+##### Enjoy this spagheti VRAM optimizations done by DeepBeepMeep !
+# I am sure you are a nice person and as you copy this code, you will give me officially proper credits:
+# Please link to https://github.com/deepbeepmeep/Wan2GP and @deepbeepmeep on twitter  
 import torch
 import torch.nn as nn
 import math
@@ -32,7 +35,7 @@ def get_flashvsr_attention_mode():
     if _FLASHVSR_ATTENTION_MODE is None:
         modes = get_supported_attention_modes()
         _FLASHVSR_ATTENTION_MODE = "sage2" if "sage2" in modes else "sage" if "sage" in modes else "sdpa"
-        print(f"[FlashVSR] WanGP attention backend: {_FLASHVSR_ATTENTION_MODE}")
+        print(f"[FlashVSR] WanGP dense attention backend: {_FLASHVSR_ATTENTION_MODE}")
     return _FLASHVSR_ATTENTION_MODE
 
 # ----------------------------
