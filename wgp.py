@@ -133,7 +133,7 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.6"
-WanGP_version = "11.775"
+WanGP_version = "11.7777"
 settings_version = 2.61
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -2191,7 +2191,8 @@ def get_lora_dir(model_type):
         raise Exception(f"loras path '{lora_dir}' exists and is not a directory")
     if not os.path.isdir(lora_dir):
         os.makedirs(lora_dir, exist_ok=True)
-    return lora_dir
+    return os.path.abspath(lora_dir)        
+    # return lora_dir
 
 attention_modes_installed = get_attention_modes()
 attention_modes_supported = get_supported_attention_modes()
@@ -3378,6 +3379,14 @@ def download_models(model_filename = None, model_type= None, file_type = 0, subm
 offload.default_verboseLevel = verbose_level
 
 
+def get_lora_local_path(lora_dir, lora):
+    if os.path.isabs(lora): return lora
+    if (lora.startswith("http:") or lora.startswith("https:")):
+        parts = lora.split("|")
+        lora_path = os.path.join(fl.clean_relative_path(parts[1]), os.path.basename(lora)) if len(parts) > 1 else os.path.basename(lora)
+    else:
+        lora_path = lora
+    return os.path.join(lora_dir, lora_path)
 
 def check_loras_exist(model_type, loras_choices_files, download = False, send_cmd = None):
     _ensure_loras_url_cache()
@@ -3385,7 +3394,7 @@ def check_loras_exist(model_type, loras_choices_files, download = False, send_cm
     missing_local_loras = []
     missing_remote_loras = []
     for lora_file in loras_choices_files:
-        local_path = os.path.join(lora_dir, os.path.basename(lora_file))
+        local_path = get_lora_local_path(lora_dir, lora_file)
         if not os.path.isfile(local_path):
             url = loras_url_cache.get(local_path, None)         
             if url is not None:
@@ -3629,6 +3638,7 @@ def ensure_prompt_enhancer_loaded(override_profile=None, progress=None, send_cmd
         setup_prompt_enhancer(pipe, kwargs)
         profile = compute_profile(override_profile, "video")
         mmgp_profile = init_pipe(pipe, kwargs, profile)
+        kwargs["pinnedMemory"] = False
         enhancer_offloadobj = offload.profile(pipe, profile_no=mmgp_profile, **kwargs)
 
     if prompt_enhancer_llm_model is None or prompt_enhancer_llm_tokenizer is None:
@@ -3742,8 +3752,6 @@ def load_models(model_type, override_profile = -1, output_type="video", **model_
         pipe = kwargs.pop("pipe")
     if "coTenantsMap" not in kwargs: kwargs["coTenantsMap"] = {}
     mmgp_profile = init_pipe(pipe, kwargs, profile)
-    if server_config.get("enhancer_mode", 1) == 0:
-        setup_prompt_enhancer(pipe, kwargs)
     loras_transformer = kwargs.pop("loras", [])
     if "transformer" in pipe:
         loras_transformer += ["transformer"]        
@@ -5793,7 +5801,6 @@ def get_transformer_loras(model_type):
     model_def = get_model_def(model_type)
     transformer_loras_filenames = get_model_recursive_prop(model_type, "loras", return_list=True)
     lora_dir = get_lora_dir(model_type)
-    transformer_loras_filenames = [ os.path.join(lora_dir, os.path.basename(filename)) for filename in transformer_loras_filenames]
     transformer_loras_multipliers = get_model_recursive_prop(model_type, "loras_multipliers", return_list=True) + [1.] * len(transformer_loras_filenames)
     transformer_loras_multipliers = transformer_loras_multipliers[:len(transformer_loras_filenames)]
     return transformer_loras_filenames, transformer_loras_multipliers
@@ -6320,15 +6327,7 @@ def generate_video(
         edit_video(send_cmd, state, mode, video_source, seed, temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, postprocess_audio, MMAudio_prompt, MMAudio_neg_prompt, repeat_generation, audio_source, seedvc_voice_sample, seedvc_voice_sample2, client_id=client_id, plugin_data=plugin_data)
         return True
     enhancer_mode = server_config.get("enhancer_mode", 1)
-    auto_prompt_enhancer_requested = enhancer_mode == 0 and prompt_enhancer is not None and len(prompt_enhancer) > 0
-    if auto_prompt_enhancer_requested:
-        from shared.prompt_enhancer import download_prompt_enhancer_assets
-
-        download_prompt_enhancer_assets(
-            enhancer_enabled=server_config.get("enhancer_enabled", 0),
-            qwen_backend=server_config.get("prompt_enhancer_quantization", "quanto_int8"),
-            send_cmd=send_cmd,
-        )
+    auto_prompt_enhancer_requested = server_config.get("enhancer_enabled", 0) > 0 and enhancer_mode == 0 and prompt_enhancer is not None and len(prompt_enhancer) > 0
     postprocess_audio = postprocess_audio or ""
     if postprocess_audio != "custom": audio_source = None
     if not seedvc_bridge.enabled():
@@ -6404,6 +6403,13 @@ def generate_video(
         seedvc_voice_sample=seedvc_voice_sample if not (is_image or audio_only) else None,
         seedvc_voice_sample2=seedvc_voice_sample2 if not (is_image or audio_only) else None,
     )
+    if args.test and auto_prompt_enhancer_requested:
+        try:
+            ensure_prompt_enhancer_loaded(override_profile=override_profile, send_cmd=send_cmd)
+        finally:
+            unload_prompt_enhancer_runtime()
+            if enhancer_offloadobj is not None:
+                enhancer_offloadobj.unload_all()
     if args.test:
         send_cmd("info", "Test mode: model loaded, skipping generation.")
         return True
@@ -6472,7 +6478,7 @@ def generate_video(
     if len(activated_loras) > 0:
         loras_list_mult_choices_nums, loras_slists, errors =  parse_loras_multipliers(loras_multipliers, len(activated_loras), num_inference_steps, nb_phases = guidance_phases, merge_slist= loras_slists, model_switch_phase= model_switch_phase )
         if len(errors) > 0: raise Exception(f"Error parsing Loras: {errors}")
-        loras_selected += [ os.path.join(lora_dir, os.path.basename(lora)) for lora in activated_loras]
+        loras_selected += activated_loras
 
     if hasattr(wan_model, "get_trans_lora"):
         trans_lora, trans2_lora = wan_model.get_trans_lora()
@@ -6483,7 +6489,7 @@ def generate_video(
         loras_selected = update_loras_url_cache(lora_dir, loras_selected)
         errors = check_loras_exist(model_type, loras_selected, True, send_cmd)
         if len(errors) > 0 : raise gr.Error(errors)
-        loras_selected = [ os.path.join(lora_dir, os.path.basename(lora)) for lora in loras_selected]
+        loras_selected = [ get_lora_local_path(lora_dir, lora) for lora in loras_selected]
         pinnedLora = not is_mps and loaded_profile !=5  # and transformer_loras_filenames == None False # # #
         preprocess_target = trans_lora if trans_lora is not None else trans
         split_linear_modules_map = getattr(preprocess_target, "split_linear_modules_map", None)
@@ -6765,11 +6771,16 @@ def generate_video(
         cached_video_guide_processed = cached_video_mask_processed = cached_video_guide_processed2 = cached_video_mask_processed2 = None
         cached_video_video_start_frame = cached_video_video_end_frame = -1
         start_time = time.time()
-        if prompt_enhancer_image_caption_model != None and prompt_enhancer !=None and len(prompt_enhancer)>0 and enhancer_mode == 0:
+        if auto_prompt_enhancer_requested:
             send_cmd("progress", [0, get_latest_status(state, "Enhancing Prompt")])
             enhancer_kwargs = {"image_prompt_type":  image_prompt_type, "video_prompt_type":  video_prompt_type, "audio_prompt_type":  audio_prompt_type}
-            enhanced_prompts = process_prompt_enhancer(model_type, model_def, prompt_enhancer, original_prompts,  image_start if image_start is not None else image_end , original_image_refs, is_image, audio_only, seed, enhancer_kwargs = enhancer_kwargs )
-            unload_prompt_enhancer_runtime()
+            try:
+                ensure_prompt_enhancer_loaded(override_profile=override_profile, send_cmd=send_cmd)
+                enhanced_prompts = process_prompt_enhancer(model_type, model_def, prompt_enhancer, original_prompts,  image_start if image_start is not None else image_end , original_image_refs, is_image, audio_only, seed, enhancer_kwargs = enhancer_kwargs )
+            finally:
+                unload_prompt_enhancer_runtime()
+                if enhancer_offloadobj is not None:
+                    enhancer_offloadobj.unload_all()
             if enhanced_prompts is not None:
                 print(f"Enhanced prompts: {enhanced_prompts}" )
                 enhanced_prompts = [normalize_generated_prompt_lines(one_prompt, multi_prompts_gen_type) for one_prompt in enhanced_prompts]
@@ -6859,8 +6870,8 @@ def generate_video(
                 input_waveform, input_waveform_sample_rate = full_audio_guide_waveform, full_audio_guide_sample_rate
             elif audio_guide is not None and model_def.get("audio_guide_window_slicing", False):
                 audio_start_frame = aligned_window_start_frame
-                if reset_control_aligment:
-                    audio_start_frame += source_video_overlap_frames_count
+                # if reset_control_aligment:
+                #     audio_start_frame += source_video_overlap_frames_count
                 input_waveform, input_waveform_sample_rate = slice_audio_window(audio_guide, audio_start_frame, current_video_length, fps, save_path, suffix=f"_win{window_no}", pad_tail=not video_length_not_limited_by_audio) 
                 if input_waveform.shape[0] == 0: input_waveform, input_waveform_sample_rate = pre_audio_guide, pre_audio_guide_sample_rate
             elif model_def.get("audio_guide_window_slicing", False):
@@ -8453,7 +8464,7 @@ def apply_lset(state, wizard_prompt_activated, lset_name, loras_choices, loras_m
             configs, _, _ = get_settings_from_file(state,lset_path , True, True, True, min_settings_version=2.38, merge_loras = merge_loras )
 
             if configs == None:
-                gr.Info("File not supported")
+                gr.Info("File not supported" + (f": {state.get('_last_settings_file_error')}" if state.get("_last_settings_file_error") else ""))
                 return [gr.update()] * 9
             settings_bundle_task_count = configs.pop("_settings_bundle_task_count", 0)
             model_type = configs["model_type"]
@@ -9238,9 +9249,8 @@ def update_loras_url_cache(lora_dir, loras_selected):
     new_loras_selected = []
     update = False
     for lora in loras_selected:
-        base_name = os.path.basename(lora)
-        local_name = os.path.join(lora_dir, base_name)
-        url = loras_url_cache.get(local_name, base_name)
+        local_name = get_lora_local_path(lora_dir, lora) 
+        url = loras_url_cache.get(local_name, local_name)
         if (lora.startswith("http:") or lora.startswith("https:")) and url != lora:
             loras_url_cache[local_name]=lora
             update = True
@@ -9259,6 +9269,7 @@ def get_settings_from_file(state, file_path, allow_json, merge_with_defaults, sw
     configs = None
     any_image_or_video = False
     any_audio = False
+    state["_last_settings_file_error"] = None
     file_path = getattr(file_path, "name", file_path)
     file_path = str(file_path or "")
     file_path_lower = file_path.lower()
@@ -9270,6 +9281,7 @@ def get_settings_from_file(state, file_path, allow_json, merge_with_defaults, sw
             pass
     elif file_path_lower.endswith(".zip") and allow_json:
         loaded_queue, error, source_task_count = _parse_settings_zip(file_path, state)
+        state["_last_settings_file_error"] = error
         if error is None and loaded_queue:
             configs = (loaded_queue[0].get("params", {}) or {}).copy()
             if source_task_count > 1:
@@ -9400,7 +9412,7 @@ def load_settings_from_file(state, file_path):
 
     configs, any_video_or_image_file, any_audio = get_settings_from_file(state, file_path, True, True, True)
     if configs == None:
-        gr.Info("File not supported")
+        gr.Info("File not supported" + (f": {state.get('_last_settings_file_error')}" if state.get("_last_settings_file_error") else ""))
         return gr.update(), gr.update(), gr.update(), gr.update(), None
     if is_deepy_display_metadata(configs):
         gr.Info("Deepy helper metadata is display-only and cannot be loaded as WanGP settings")
@@ -9982,10 +9994,10 @@ def refresh_video_prompt_type_video_guide(state, filter_type, video_prompt_type,
     image_mask_guide, image_guide, image_mask = switch_image_guide_editor(image_mode, old_video_prompt_type , video_prompt_type, old_image_mask_guide_value, old_image_guide_value, old_image_mask_value )
     # mask_video_input_visible =  image_mode == 0 and mask_visible
     mask_preprocessing = model_def.get("mask_preprocessing", None)
-    if mask_preprocessing  is not None:
-        mask_selector_visible = mask_preprocessing.get("visible", True)
+    if mask_preprocessing  is None:
+        mask_selector_visible = False
     else:
-        mask_selector_visible = True
+        mask_selector_visible = mask_preprocessing.get("visible", True)
     ref_images_visible = "I" in video_prompt_type
     custom_options = custom_checkbox = False 
     custom_video_selection = model_def.get("custom_video_selection", None)
@@ -10681,9 +10693,9 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                 end_option_visible = end_frames_option_visible(model_def, image_prompt_type_value) and not image_outputs
                 image_prompt_type_choices = []
                 if "T" in image_prompt_types_allowed: 
-                    image_prompt_type_choices += [("Text Prompt Only" if "S" in image_prompt_types_allowed else "New Video", "")]
+                    image_prompt_type_choices += [("Text Prompt" if "S" in image_prompt_types_allowed else "New Video", "")]
                 if "S" in image_prompt_types_allowed: 
-                    image_prompt_type_choices += [("Start Video with Image", "S")]
+                    image_prompt_type_choices += [("Start with Image", "S")]
                     any_start_image = True
                 if "V" in image_prompt_types_allowed:
                     any_video_source = True
@@ -11162,6 +11174,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                 prompt_enhancer_think_visible = server_config.get("enhancer_enabled", 0) in (3, 4)
                 prompt_enhancer_think_value = prompt_enhancer_think_visible and "K" in prompt_enhancer_value and len(prompt_enhancer_mode_value) > 0
                 prompt_enhancer_value = build_prompt_enhancer_value(prompt_enhancer_mode_value, prompt_enhancer_think_value)
+                prompt_enhancer_think_classes = "cbx_centered" if on_demand_prompt_enhancer else "cbx_bottom"
                 prompt_enhancer = gr.Text(value=prompt_enhancer_value, visible=False)
                 prompt_enhancer_mode_dropdown = gr.Dropdown(
                     choices=prompt_enhancer_choices,
@@ -11169,7 +11182,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                     label=model_def.get("prompt_enhancer_button_label", "Enhance Prompt using a LLM") , scale = 5,
                     visible= True, show_label= not on_demand_prompt_enhancer,
                 )
-                prompt_enhancer_think = gr.Checkbox(label="Think", value=prompt_enhancer_think_value, visible=prompt_enhancer_think_visible, scale=1, elem_classes="cbx_centered")
+                prompt_enhancer_think = gr.Checkbox(label="Think", value=prompt_enhancer_think_value, visible=prompt_enhancer_think_visible, scale=1, elem_classes=prompt_enhancer_think_classes)
             alt_prompt_def = model_def.get("alt_prompt", None)
             alt_prompt_label = None
             alt_prompt_placeholder = ""
