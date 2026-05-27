@@ -4,6 +4,8 @@ os.environ["GRADIO_LANG"] = "en"
 p = os.path.dirname(os.path.abspath(__file__))
 if p not in sys.path:
     sys.path.insert(0, p)
+from shared.native_runtime import preload_preferred_libstdcxx
+preload_preferred_libstdcxx()
 from shared.default_device import set_default_cuda_device_from_arg; set_default_cuda_device_from_arg("gpu")
 # # os.environ.pop("TORCH_LOGS", None)  # make sure no env var is suppressing/overriding
 # os.environ["TORCH_LOGS"]= "recompiles"
@@ -134,7 +136,7 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.6"
-WanGP_version = "11.80"
+WanGP_version = "11.83"
 settings_version = 2.61
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -3430,7 +3432,8 @@ def check_loras_exist(model_type, loras_choices_files, download = False, send_cm
                         send_cmd("status", f'Downloading Lora {os.path.basename(lora_file)}...')
                     try:
                         download_file(url, local_path)
-                    except:
+                    except Exception as e:
+                        print(f"Error downloading {url}:{e}")
                         missing_remote_loras.append(lora_file)
             else:
                 missing_local_loras.append(lora_file)
@@ -3940,13 +3943,13 @@ def build_callback(state, pipe, send_cmd, status, num_inference_steps, preview_m
                 if pass_no <=0:
                     phase = "Denoising"
                 elif pass_no == 1:
-                    phase = "Denoising First Pass"
+                    phase = "Denoising First Phase"
                 elif pass_no == 2:
-                    phase = "Denoising Second Pass"
+                    phase = "Denoising Second Phase"
                 elif pass_no == 3:
-                    phase = "Denoising Third Pass"
+                    phase = "Denoising Third Phase"
                 else:
-                    phase = f"Denoising {pass_no}th Pass"
+                    phase = f"Denoising {pass_no}th Phase"
 
                 if len(denoising_extra) > 0: phase += " | " + denoising_extra
 
@@ -4352,8 +4355,9 @@ def select_video(state, current_gallery_tab, input_file_list, file_selected, aud
         if data!=None and isinstance(data, dict):
             choice = data.get("index",0)        
         else:
-            choice = gen.get("selected", max(file_selected, 0) )
+            choice = gen.get("selected", file_selected)
         choice = min(len(file_list)-1, choice) 
+        if choice < 0 and len(file_list) > 0: choice = 0
         set_file_choice(gen, file_list, choice)
         files, settings_list = file_list, file_settings_list
     else:
@@ -4365,6 +4369,7 @@ def select_video(state, current_gallery_tab, input_file_list, file_selected, aud
         else:
             choice = gen.get("audio_selected",-1)
         choice = min(len(audio_file_list)-1, choice)
+        if choice < 0 and len(audio_file_list) > 0: choice = 0
         set_file_choice(gen,  audio_file_list, choice, audio_files=True )
         files, settings_list = audio_file_list, audio_file_settings_list
 
@@ -4806,7 +4811,7 @@ def select_video(state, current_gallery_tab, input_file_list, file_selected, aud
 
             if len(video_activated_loras_str) > 0:
                 values += [video_activated_loras_str]
-                labels += ["Loras"] 
+                labels += ["LoRAs"] 
             if nb_audio_tracks  > 0:
                 values +=[nb_audio_tracks]
                 labels +=["Nb Audio Tracks"]
@@ -6494,7 +6499,7 @@ def generate_video(
     if transformer_loras_filenames != None:
         loras_list_mult_choices_nums, loras_slists, errors =  parse_loras_multipliers(transformer_loras_multipliers, len(transformer_loras_filenames), num_inference_steps, nb_phases = guidance_phases, model_switch_phase= model_switch_phase )
         if len(errors) > 0: raise Exception(f"Error parsing Transformer Loras: {errors}")
-        loras_selected = transformer_loras_filenames 
+        loras_selected = transformer_loras_filenames[:] 
 
     if hasattr(wan_model, "get_loras_transformer"):
         extra_loras_transformers, extra_loras_multipliers = wan_model.get_loras_transformer(get_model_recursive_prop, **locals())
@@ -9191,11 +9196,16 @@ def collect_current_model_settings_with_media(state):
     settings["model_type"] = model_type
     return settings
 
-def export_settings(state):
+def export_settings(state, include_media=False):
     model_type = get_state_model_type(state)
+    filename = sanitize_file_name(model_type + "_" + datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%Hh%Mm%Ss") + (".zip" if include_media else ".json"))
+    if include_media:
+        with io.BytesIO() as zip_buffer:
+            ok = _save_queue_to_zip([{"id": 1, "params": collect_current_model_settings_with_media(state)}], zip_buffer)
+            if not ok: gr.Warning("Failed to export settings with media.")
+            return (base64.b64encode(zip_buffer.getvalue()).decode('utf-8'), filename) if ok else ("", "")
     text = json.dumps(collect_current_model_settings(state), indent=4)
-    text_base64 = base64.b64encode(text.encode('utf8')).decode('utf-8')
-    return text_base64, sanitize_file_name(model_type + "_" + datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%Hh%Mm%Ss") + ".json")
+    return base64.b64encode(text.encode('utf8')).decode('utf-8'), filename
 
 
 def extract_and_apply_source_images(file_path, current_settings):
@@ -10604,6 +10614,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
     if len(launch_loras) == 0:
         launch_multis_str = ui_defaults.get("loras_multipliers","")
         launch_loras = ui_defaults.get("activated_loras",[])
+    launch_loras = update_loras_url_cache(get_lora_dir(model_type), launch_loras)
     with gr.Row():
         column_kwargs = {'elem_id': 'edit-tab-content'} if tab_id == 'edit' else {}
         with gr.Column(**column_kwargs):
@@ -11429,18 +11440,19 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                                 label= "How to Process each Line of the Text Prompt"
                             )
 
-                with gr.Tab("Loras", visible= not audio_only or model_def.get("enabled_audio_lora", False)) as loras_tab:
+                with gr.Tab("LoRAs", visible= not audio_only or model_def.get("enabled_audio_lora", False)) as loras_tab:
                     with gr.Column(visible = True): #as loras_column:
-                        gr.Markdown("<B>Loras can be used to create special effects on the video by mentioning a trigger word in the Prompt. You can save Loras combinations in presets.</B>")
+                        gr.Markdown("<B>LoRAs can be used to create special effects on the video by mentioning a trigger word in the Prompt. You can save Loras combinations in presets.</B>")
                         loras, loras_hierarchy = get_updated_loras_dropdown(loras, launch_loras)
                         state_dict["loras"] = loras
                         loras_choices = HierarchySelector(
                             hierarchy=loras_hierarchy,
                             value= launch_loras,
                             height=10,
-                            label="Activated Loras",
+                            label="Activated LoRAs",
+                            search_empty_label="No matching LoRAs",
                         )
-                        loras_multipliers = gr.Textbox(label="Loras Multipliers (1.0 by default) separated by Space chars or CR, lines that start with # are ignored", value=launch_multis_str)
+                        loras_multipliers = gr.Textbox(label="LoRAs Multipliers (1.0 by default) separated by Space chars or CR, lines that start with # are ignored", value=launch_multis_str)
                 with gr.Tab("Steps Skipping", visible = any_tea_cache or any_mag_cache) as speed_tab:
                     with gr.Column():
                         gr.Markdown("<B>Tea Cache and Mag Cache accelerate the Video Generation by skipping intelligently some steps, the more steps are skipped the lower the quality of the video.</B>")
@@ -11756,6 +11768,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                                 ("24", "24"), 
                                 ("25", "25"), 
                                 ("30", "30"), 
+                                ("48", "48"), 
                                 ("50", "50"), 
                             ]
                     
@@ -11794,9 +11807,10 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                 with gr.Row():
                     save_settings_btn = gr.Button("Set Settings as Default", visible = not args.lock_config)
                     export_settings_from_file_btn = gr.Button("Export Settings to File")
+                    export_settings_include_media = gr.Checkbox(label="Include Media", value=False)
                     reset_settings_btn = gr.Button("Reset Settings")
                 with gr.Row():
-                    settings_file = gr.File(height=41,label="Load Settings From Video / Image / Audio / JSON / ZIP")
+                    settings_file = gr.File(height=41,label="Load Settings From Media File / Json / Zip")
                     settings_base64_output = gr.Text(interactive= False, visible=False, value = "")
                     settings_filename =  gr.Text(interactive= False, visible=False, value = "")
                 with gr.Group():
@@ -12227,7 +12241,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                 inputs =[target_state] + gen_inputs,
                 outputs= None
             ).then(fn=export_settings, 
-                inputs =[state], 
+                inputs =[state, export_settings_include_media],
                 outputs= [settings_base64_output, settings_filename]
             ).then(
                 fn=None,
@@ -12492,6 +12506,9 @@ def _get_dropdown_deps():
 
 def create_models_hierarchy(rows):
     return model_dropdowns.create_models_hierarchy(rows)
+
+def create_models_selector_hierarchy(dropdown_types=None):
+    return model_dropdowns.create_models_selector_hierarchy(_get_dropdown_deps(), dropdown_types)
 
 def get_sorted_dropdown(dropdown_types, current_model_family, current_model_type, three_levels = True):
     return model_dropdowns.get_sorted_dropdown(_get_dropdown_deps(), dropdown_types, current_model_family, current_model_type, three_levels)
