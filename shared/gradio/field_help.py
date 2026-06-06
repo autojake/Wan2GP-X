@@ -163,11 +163,17 @@ def get_javascript():
         return null;
     };
     window.wangpFieldHelp.hasTrigger = function(label, popupId) {
+        var found = false;
         var triggers = label.querySelectorAll("[data-wangp-field-help-trigger]");
         for (var i = 0; i < triggers.length; i++) {
-            if (triggers[i].getAttribute("data-wangp-field-help-trigger") === popupId) return true;
+            var trigger = triggers[i];
+            if (trigger.getAttribute("data-wangp-field-help-trigger") === popupId && !found) {
+                found = true;
+            } else {
+                trigger.remove();
+            }
         }
-        return false;
+        return found;
     };
     window.wangpFieldHelp.collectActivePopups = function(markers) {
         var activePopups = {};
