@@ -62,7 +62,7 @@ from shared.utils.media_recording import record_file_metadata as shared_record_f
 from shared.utils.settings_bundle import is_wangp_settings_filename
 from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_stream_metadata
 from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entry, get_virtual_media_vsource, parse_virtual_media_path, replace_virtual_media_source, strip_virtual_media_suffix
-from shared.utils.frame_scheduler import build_extension_window, build_frame_scheduler, has_slash_commands
+from shared.utils.frame_scheduler import build_extension_window, build_frame_scheduler, has_slash_commands, prepare_loras_mult_windows
 from shared.match_archi import match_nvidia_architecture
 from shared.attention import get_attention_modes, get_supported_attention_modes, get_default_attention_mode
 from shared.utils.utils import truncate_for_filesystem, sanitize_file_name, process_images_multithread, get_default_workers
@@ -139,7 +139,7 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.6"
-WanGP_version = "12.12"
+WanGP_version = "12.13"
 settings_version = 2.61
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -1034,6 +1034,9 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
         _, _, errors =  parse_loras_multipliers(loras_multipliers, len(activated_loras), num_inference_steps, nb_phases= guidance_phases)
         if len(errors) > 0: 
             return err(f"Error parsing Loras Multipliers: {errors}")
+    loras_mult_error = prepare_loras_mult_windows(frame_scheduler, activated_loras, num_inference_steps, guidance_phases)
+    if loras_mult_error is not None:
+        return err(loras_mult_error)
     if guidance_phases == 3:
         if switch_threshold < switch_threshold2:
             return err(f"Phase 1-2 Switch Noise Level ({switch_threshold}) should be Greater than Phase 2-3 Switch Noise Level ({switch_threshold2}). As a reminder, noise will gradually go down from 1000 to 0.")
@@ -3442,7 +3445,7 @@ def download_requested_postprocessing_assets(send_cmd, *, postprocess_audio="", 
     if seedvc_voice_sample is not None:
         download_seedvc(send_cmd, "Downloading SeedVC model files...")
     if seedvc_voice_sample2 is not None or postprocess_audio == "seedvc2":
-        from shared.utils.download import download_speaker_separator
+        from preprocessing.speaker_separator.assets import download_speaker_separator
         download_speaker_separator(send_cmd, "Downloading speaker separator model files...")
 
 
@@ -5818,6 +5821,7 @@ def edit_video(
     video_extension = f".{video_container}"
 
     tmp_path = None
+    saved_video_duration = None
     any_change = False
     if sample != None:
         if source_is_image:
@@ -5836,6 +5840,7 @@ def edit_video(
             return
         video_path = get_available_filename(save_path, video_source, "_tmp", force_extension=video_extension) if any_mmaudio or has_already_audio else get_available_filename(save_path, video_source, "_post", force_extension=video_extension)
         video_path = save_video( tensor=sample[None], save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type= server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"))
+        saved_video_duration = sample.shape[1] / output_fps
 
         if any_mmaudio or has_already_audio: tmp_path = video_path
         any_change = True
@@ -5896,7 +5901,7 @@ def edit_video(
             if any_seedvc:
                 send_cmd("progress", [0, get_latest_status(state,"SeedVC Voice Replacement")])
                 if seedvc_speaker_count == 2:
-                    from shared.utils.download import download_speaker_separator
+                    from preprocessing.speaker_separator.assets import download_speaker_separator
                     download_speaker_separator(send_cmd, "Downloading speaker separator model files...")
                 seedvc_audio_tracks, seedvc_temp_tracks = seedvc_bridge.replace_audio_tracks(audio_tracks, seedvc_voice_sample, save_path, f"tmp_seed{seed}_{repeat_no}", process_files=process_files_def, profile_no=server_config.get("audio_profile", 4), verbose_level=verbose_level, init_pipe=init_pipe, voice_sample2_path=seedvc_voice_sample2, speaker_count=seedvc_speaker_count)
                 seedvc_sample_rate = resolve_mux_audio_sampling_rate(22050, audio_paths=seedvc_audio_tracks)
@@ -5912,7 +5917,7 @@ def edit_video(
                 )
                 cleanup_temp_audio_files(seedvc_temp_tracks)
             else:
-                combine_video_with_audio_tracks(video_path, audio_tracks, new_video_path, audio_metadata=audio_metadata, audio_codec_key=server_config.get("audio_output_codec", "aac_128"))
+                combine_video_with_audio_tracks(video_path, audio_tracks, new_video_path, audio_metadata=audio_metadata, audio_codec_key=server_config.get("audio_output_codec", "aac_128"), video_duration=saved_video_duration)
         else:
             new_video_path = video_path
         if tmp_path != None:
@@ -5975,7 +5980,7 @@ def edit_audio(send_cmd, state, audio_source, postprocess_audio, seedvc_voice_sa
             raise gr.Error("You must provide a second SeedVC Voice Sample")
         download_seedvc(send_cmd, "Downloading SeedVC model files...")
         if seedvc_speaker_count == 2:
-            from shared.utils.download import download_speaker_separator
+            from preprocessing.speaker_separator.assets import download_speaker_separator
             download_speaker_separator(send_cmd, "Downloading speaker separator model files...")
         send_cmd("progress", [0, get_latest_status(state, "SeedVC Voice Replacement")])
         new_audio_path = seedvc_bridge.replace_audio_file(
@@ -6738,6 +6743,7 @@ def generate_video(
         if len(errors) > 0: raise Exception(f"Error parsing Extra Transformer Loras: {errors}")
         loras_selected += extra_loras_transformers 
 
+    base_loras_slists = loras_slists
     if len(activated_loras) > 0:
         loras_list_mult_choices_nums, loras_slists, errors =  parse_loras_multipliers(loras_multipliers, len(activated_loras), num_inference_steps, nb_phases = guidance_phases, merge_slist= loras_slists, model_switch_phase= model_switch_phase )
         if len(errors) > 0: raise Exception(f"Error parsing Loras: {errors}")
@@ -6837,6 +6843,8 @@ def generate_video(
         if frame_scheduler_error is not None:
             raise gr.Error(frame_scheduler_error)
     if frame_scheduler is not None and frame_scheduler["active"]:
+        loras_mult_error = prepare_loras_mult_windows(frame_scheduler, activated_loras, num_inference_steps, guidance_phases, base_loras_slists=base_loras_slists, model_switch_phase=model_switch_phase, store_slists=True)
+        if loras_mult_error is not None: raise gr.Error(loras_mult_error)
         prompts = frame_scheduler["prompts"]
         video_length = frame_scheduler["predicted_total_frames"]
         current_video_length = video_length
@@ -6941,7 +6949,7 @@ def generate_video(
         else:
             if "X" in audio_prompt_type: 
                 # dual speaker, voice separation
-                from preprocessing.speakers_separator import extract_dual_audio
+                from preprocessing.speaker_separator import extract_dual_audio
                 combination_type = "para"
                 if args.save_speakers:
                     audio_guide, audio_guide2  = "speaker1.wav", "speaker2.wav"
@@ -7120,9 +7128,10 @@ def generate_video(
                     break
                 frame_window_options = scheduled_windows[window_no]
                 prompt, reuse_frames, current_video_length, new_shot, discard_last_frames = frame_window_options["prompt"], frame_window_options["overlap_frames"], frame_window_options["frame_num"], frame_window_options["new_shot"], frame_window_options["discard_last_frames"]
+                current_loras_slists = frame_window_options.get("loras_slists", loras_slists)
                 sliding_window = True
             else:
-                frame_window_options, new_shot, discard_last_frames = None, False, default_discard_last_frames
+                frame_window_options, current_loras_slists, new_shot, discard_last_frames = None, loras_slists, False, default_discard_last_frames
                 prompt =  prompts[window_no] if window_no < len(prompts) else prompts[-1]
                 requested_frames_to_generate +=  new_extra_windows * (sliding_window_size - discard_last_frames - reuse_frames)
                 sliding_window = sliding_window  or extra_windows > 0
@@ -7585,7 +7594,7 @@ def generate_video(
                     keep_frames_parsed = keep_frames_parsed,
                     model_filename = model_filename,
                     model_type = base_model_type,
-                    loras_slists = loras_slists,
+                    loras_slists = current_loras_slists,
                     NAG_scale = NAG_scale,
                     NAG_tau = NAG_tau,
                     NAG_alpha = NAG_alpha,

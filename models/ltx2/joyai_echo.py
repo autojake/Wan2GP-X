@@ -35,7 +35,7 @@ Generic window commands:
 
 JoyAI-Echo memory commands:
 
-- `[/store_mem=man1,man2]`: save named memories from this window, sampled at different moments. Multiple names for the same character can strengthen later reuse.
+- `[/store_mem=man1,man2]`: save named memories from this window, sampled at different moments. Multiple names for the same character will record in memory multiple 8 frames clips (with audio) at different times and provide more hints to the model for later reuse.
 - `[/load_mem=man1,woman1]`: use only these named memories for this window. If a named memory is cached but not active, Joy loads it into an internal slot.
 - `[/load_mem]` or `[/load_mem=]`: use no Joy memory for this window.
 - `[/drop_mem=old_scene,side_prop]`: remove named memories from active memory and from the persistent RAM cache.
@@ -53,7 +53,7 @@ You can combine commands in one bracket, for example `[/duration=8s,/new_shot,/l
 - Store only the windows that are useful later. Memories are not saved automatically.
 - Use named memories when the story has several people or objects. Names make it easier to load the right identities later or drop stale ones.
 - Use `[/new_shot]` to introduce a new person or location without visual overlap from the previous window. Joy memory can still influence later windows when loaded.
-- Use `[/load_mem]` before unrelated inserts or scene resets that should not reuse earlier memory.
+- Use `[/load_mem=]` when a new shot introduces a new character and should not be influenced by previous memories.
 - Use a Control Video with an audio track to predefine memory before generation. Select JoyAI-Echo Control Video Memory, then leave positions empty for automatic non-silent selection, enter positions like `2s, 8s, 15s`, or name them like `man=2s,woman=8s`.
 
 **Three-Window Example**
@@ -61,9 +61,24 @@ You can combine commands in one bracket, for example `[/duration=8s,/new_shot,/l
 ```text
 [/duration=8s,/store_mem=magician1,magician2] ID_A is a retired stage magician with silver hair, a burgundy velvet jacket, expressive eyebrows, and a dry theatrical voice. He stands inside an abandoned seaside theater at night, opens a lacquered box, reveals a glowing blue playing card, and says, "I retired from miracles because the miracles started freelancing." Keep his face and lip movement clear in a stable medium close-up. Add dusty gold footlights, torn red curtains, distant waves, old wood creaks, and soft card handling.
 
-[/duration=8s,/new_shot,/store_mem=duck1,duck2] ID_B is a small yellow duck inspector wearing a tiny teal raincoat, round brass spectacles, polished rubber boots, and a serious waterproof satchel. ID_B waddles through the theater aisle, sees the glowing card, and quacks in a crisp subtitle-like comic rhythm, "That door has not filed the proper puddle paperwork." Keep ID_B's duck design, bill movement, spectacles, and raincoat clear in a medium shot with squeaky footsteps, distant surf, and a tiny official whistle.
+[/duration=8s,/new_shot,/load_mem=,/store_mem=duck1,duck2] ID_B is a small yellow duck inspector wearing a tiny teal raincoat, round brass spectacles, polished rubber boots, and a serious waterproof satchel. ID_B waddles through the theater aisle, sees the glowing card, and quacks in a crisp subtitle-like comic rhythm, "That door has not filed the proper puddle paperwork." Keep ID_B's duck design, bill movement, spectacles, and raincoat clear in a medium shot with squeaky footsteps, distant surf, and a tiny official whistle.
 
-[/duration=8s,/new_shot,/load_mem=magician1,duck1] ID_A and ID_B are together on the same seaside theater stage. ID_A is still the silver-haired retired magician in the burgundy velvet jacket with the dry theatrical voice and glowing blue card. ID_B is still the small yellow duck inspector in the teal raincoat, spectacles, boots, and serious satchel. The glowing door opens between them onto a miniature harbor full of lantern boats. ID_A says, "I told you the door was shy." ID_B replies, "Shy doors still need permits." Keep both identities, voices, scale difference, readable lip and bill movement, card glow, theater details, tiny waves, and playful overlapping laughter.
+[/duration=8s,/new_shot,/load_mem=magician1,magician2,duck1,duck2] ID_A and ID_B are together on the same seaside theater stage. ID_A is still the silver-haired retired magician in the burgundy velvet jacket with the dry theatrical voice and glowing blue card. ID_B is still the small yellow duck inspector in the teal raincoat, spectacles, boots, and serious satchel. The glowing door opens between them onto a miniature harbor full of lantern boats. ID_A says, "I told you the door was shy." ID_B replies, "Shy doors still need permits." Keep both identities, voices, scale difference, readable lip and bill movement, card glow, theater details, tiny waves, and playful overlapping laughter.
+```
+
+**Prompt Enhancer**
+
+The prompt enhancer works best when your source prompt already describes the story window by window. This gives the enhancer a plan to expand instead of letting it invent disconnected shots. Name the recurring characters and say what should happen in each window.
+
+Example source prompt:
+
+```text
+A warm comic story about a cautious widower who runs a tiny neighborhood restaurant and a confident sailor who fixes boats and hates fancy food.
+- Window 1: show the man alone in his restaurant before opening time, practicing a dinner speech and worrying that the soup is too dramatic.
+- Window 2: show the woman alone on her small boat, repairing a radio and joking that the sea is a terrible sous-chef.
+- Window 3: the man and woman meet in the restaurant during a sudden rainstorm; she brings a broken compass, he serves the dramatic soup, and they argue playfully.
+- Window 4: they travel together on the woman's boat, using the man's soup pot as an improvised compass holder while laughing about their terrible navigation.
+- Window 5: they reach a frozen northern harbor and hold a tiny wedding on the ice, with the soup pot as the ceremonial bell.
 ```
 """
 
@@ -240,7 +255,7 @@ class JoyAIEchoMemoryBank:
 
     def _entry_label(self, slot_id: int, entry: dict) -> str:
         name = entry.get("name")
-        return f"{slot_id}[{name}]" if name else str(slot_id)
+        return f"{name}[slot {slot_id}]" if name else f"slot {slot_id}"
 
     def labels(self) -> list[str]:
         return [self._entry_label(slot_id, entry) for slot_id, entry in self._slot_items()]
@@ -717,8 +732,7 @@ def build_control_video_memory(model, control_video_path: str, positions_text: s
     return {"video": video, "audio": audio, "names": names}
 
 
-def generate_joyai_echo_window(model, single_shot_generate, **call_args):
-    gen_state = call_args.get("gen_state")
+def prepare_joyai_echo_context(model, gen_state, custom_settings, video_guide, frame_window_options, fps, video_prompt_type, height, width, guide_phases, VAE_tile_size, window_no):
     if not isinstance(gen_state, dict):
         gen_state = {}
     joy_state = gen_state.setdefault("joyai_echo", {})
@@ -731,15 +745,16 @@ def generate_joyai_echo_window(model, single_shot_generate, **call_args):
         )
         joy_state["memory_bank"] = memory_bank
 
-    fps = float(call_args.get("fps", model.model_def.get("fps", 25)) or 25)
-    custom_settings = call_args.get("custom_settings") if isinstance(call_args.get("custom_settings"), dict) else {}
-    control_memory_enabled = "1" in (call_args.get("video_prompt_type", "") or "")
-    control_video_path = call_args.get("video_guide")
-    control_key = (control_video_path, custom_settings.get(JOYAI_CONTROL_MEMORY_SETTING, ""), int(call_args.get("height")), int(call_args.get("width")), int(call_args.get("guide_phases", call_args.get("guidance_phases", 1)) or 1))
+    fps = float(fps or model.model_def.get("fps", 25) or 25)
+    custom_settings = custom_settings if isinstance(custom_settings, dict) else {}
+    control_memory_enabled = "1" in (video_prompt_type or "")
+    control_video_path = video_guide
+    guide_phases = int(guide_phases or 1)
+    control_key = (control_video_path, custom_settings.get(JOYAI_CONTROL_MEMORY_SETTING, ""), int(height), int(width), guide_phases)
     if control_memory_enabled and joy_state.get("control_key") != control_key:
         if not control_video_path:
             raise RuntimeError("JoyAI-Echo Control Video Memory requires the original Control Video path.")
-        target_height, target_width = int(call_args.get("height")), int(call_args.get("width"))
+        target_height, target_width = int(height), int(width)
         target_height = int(math.ceil(target_height / 64) * 64) if target_height % 64 else target_height
         target_width = int(math.ceil(target_width / 64) * 64) if target_width % 64 else target_width
         artificial_memory = build_control_video_memory(
@@ -749,8 +764,8 @@ def generate_joyai_echo_window(model, single_shot_generate, **call_args):
             fps=fps,
             height=target_height,
             width=target_width,
-            two_phase=int(call_args.get("guide_phases", call_args.get("guidance_phases", 1)) or 1) > 1,
-            VAE_tile_size=call_args.get("VAE_tile_size"),
+            two_phase=guide_phases > 1,
+            VAE_tile_size=VAE_tile_size,
         )
         stored, discarded = memory_bank.add_artificial_memory(artificial_memory)
         _debug_memory(f"control video memory stored {len(stored)} slot(s): {_memory_labels_text(stored)}")
@@ -758,24 +773,19 @@ def generate_joyai_echo_window(model, single_shot_generate, **call_args):
             _debug_memory(f"slots {len(discarded)} discarded: {_memory_labels_text(discarded)}")
         joy_state["control_key"] = control_key
 
-    window_options = call_args.get("frame_window_options") if isinstance(call_args.get("frame_window_options"), dict) else {}
+    window_options = frame_window_options if isinstance(frame_window_options, dict) else {}
     model_options = window_options.get("model_options", {}) if isinstance(window_options.get("model_options", {}), dict) else {}
     drop_mem = model_options.get("drop_mem", None)
     if drop_mem is not None:
         dropped = memory_bank.drop(parse_drop_mem_option(drop_mem))
-        _debug_memory(f"/drop_mem={drop_mem}: removed {len(dropped)} memory item(s): {_memory_labels_text(dropped)}")
+        print(f"[WAN2GP][JoyAI-Echo] window={window_no} dropped memories: {_memory_labels_text(dropped)}", flush=True)
     if "no_mem" in model_options:
         print("[WAN2GP][JoyAI-Echo] /no_mem is deprecated because memories are no longer saved automatically; ignoring it.", flush=True)
     load_mem = model_options.get("load_mem", None)
     if load_mem is not None:
-        loaded, discarded = memory_bank.load(parse_load_mem_option(load_mem))
-        _debug_memory(f"/load_mem={load_mem}: active memory {len(loaded)} item(s): {_memory_labels_text(loaded)}")
-        if discarded:
-            _debug_memory(f"/load_mem={load_mem}: deactivated {len(discarded)} item(s): {_memory_labels_text(discarded)}")
+        memory_bank.load(parse_load_mem_option(load_mem))
     store_mem_selectors = parse_store_mem_option(model_options.get("store_mem")) if "store_mem" in model_options else []
     record_memory = bool(store_mem_selectors)
-    if "store_mem" in model_options:
-        _debug_memory(f"/store_mem={model_options.get('store_mem')}: will store {len(store_mem_selectors)} named item(s): {_memory_selectors_text(store_mem_selectors)}")
     audio_memory_enabled = bool(model.model_def.get("joyai_audio_memory", False))
     reference_context = {
         "video_latent": memory_bank.video_latent("phase1"),
@@ -790,37 +800,27 @@ def generate_joyai_echo_window(model, single_shot_generate, **call_args):
         "downscale_factor": int(model.model_def.get("joyai_memory_downscale_factor", 1)),
         "return_latents": record_memory,
         "debug_memory": JOYAI_DEBUG_MEMORY,
-        "window_no": call_args.get("window_no", 1),
+        "window_no": window_no,
         "memory_labels": memory_bank.labels(),
     }
-
-    shot_args = dict(call_args)
-    shot_args["joyai_single_window"] = True
-    if control_memory_enabled or "V" in (call_args.get("video_prompt_type", "") or ""):
-        shot_args.update({"input_frames": None, "input_frames2": None, "input_masks": None, "input_masks2": None, "video_prompt_type": ""})
     active_memory_labels = memory_bank.labels()
-    print(f"[WAN2GP][JoyAI-Echo] window={call_args.get('window_no', 1)} frames={call_args.get('frame_num')} overlap={call_args.get('prefix_frames_count', 0)} using_memory={_memory_labels_text(active_memory_labels)} record_memory={record_memory} store_mem={_memory_selectors_text(store_mem_selectors)}", flush=True)
-    if JOYAI_DEBUG_MEMORY:
-        phase1_video_slots = 0 if reference_context["video_latent"] is None else reference_context["video_latent"].shape[2]
-        phase2_video_slots = 0 if reference_context["video_latent_stage2"] is None else reference_context["video_latent_stage2"].shape[2]
-        phase1_audio_slots = 0 if reference_context["audio_segment_lengths"] is None else len(reference_context["audio_segment_lengths"][0])
-        phase2_audio_slots = 0 if reference_context["audio_segment_lengths_stage2"] is None else len(reference_context["audio_segment_lengths_stage2"][0])
-        _debug_memory(f"window={call_args.get('window_no', 1)} guiding memory to inject: phase1_video={phase1_video_slots} phase1_audio={phase1_audio_slots} phase2_video={phase2_video_slots} phase2_audio={phase2_audio_slots} slots={_memory_labels_text(reference_context['memory_labels'])}")
-    with model.pipeline.joyai_echo_context(reference_context):
-        result = single_shot_generate(**shot_args)
-    if result is None:
-        return None
+    print(f"[WAN2GP][JoyAI-Echo] window={window_no} loading memories: {_memory_labels_text(active_memory_labels)}", flush=True)
+    clear_control_inputs = control_memory_enabled or "V" in (video_prompt_type or "")
+    return reference_context, memory_bank, store_mem_selectors, clear_control_inputs
+
+
+def record_joyai_echo_memory(model, result, memory_bank, store_mem_selectors, prefix_frames_count, frame_num, fps, window_no):
     memory_latents = result.pop("_memory_latents", None)
-    if record_memory:
-        trim_frames = max(0, int(call_args.get("prefix_frames_count", 0) or 0))
+    if store_mem_selectors:
+        trim_frames = max(0, int(prefix_frames_count or 0))
         stored, discarded = memory_bank.add_generation(
             model,
-            _trim_memory_latents(model, memory_latents, trim_frames, int(call_args.get("frame_num", 0) or 0)),
-            audio_waveform=_trim_audio_start(result.get("audio"), trim_frames, fps, result.get("audio_sampling_rate")),
+            _trim_memory_latents(model, memory_latents, trim_frames, int(frame_num or 0)),
+            audio_waveform=_trim_audio_start(result.get("audio"), trim_frames, float(fps or model.model_def.get("fps", 25) or 25), result.get("audio_sampling_rate")),
             audio_sample_rate=result.get("audio_sampling_rate"),
             store_selectors=store_mem_selectors,
         )
-        _debug_memory(f"stored {len(stored)} slot(s): {_memory_labels_text(stored)}")
+        print(f"[WAN2GP][JoyAI-Echo] window={window_no} recorded memories: {_memory_labels_text(stored)}; total active memories={len(memory_bank)} cached memories={len(memory_bank.cache)}", flush=True)
         if discarded:
-            _debug_memory(f"slots {len(discarded)} discarded: {_memory_labels_text(discarded)}")
+            print(f"[WAN2GP][JoyAI-Echo] window={window_no} discarded memories: {_memory_labels_text(discarded)}", flush=True)
     return result
