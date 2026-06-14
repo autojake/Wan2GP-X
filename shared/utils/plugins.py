@@ -1,7 +1,6 @@
 import os
 import sys
 import importlib
-import importlib.util
 import inspect
 import re
 import datetime
@@ -15,12 +14,18 @@ import shutil
 import stat
 import json
 import requests
+from shared.utils.wgp_config_migration import migrate_mediaflow_plugin_id
 media_gen_label = "Media Generator"
 
 COMMUNITY_PLUGINS_URL = "https://github.com/deepbeepmeep/Wan2GP/raw/refs/heads/main/plugins.json"
 PLUGIN_CATALOG_FILENAME = "plugins.json"
 PLUGIN_LOCAL_CATALOG_FILENAME = "plugins_local.json"
 PLUGIN_METADATA_FILENAME = "plugin_info.json"
+PLUGIN_TYPE_CHOICES = ("app", "extension", "spatial_upsampler", "model")
+PLUGIN_SPATIAL_UPSAMPLER_HANDLERS_KEY = "spatial_upsampler_handlers"
+PLUGIN_MODEL_HANDLERS_KEY = "model_handlers"
+PLUGIN_MODEL_DEFAULTS_KEY = "defaults"
+PLUGIN_MODEL_PROFILES_KEY = "profiles"
 PENDING_DELETIONS_KEY = "pending_plugin_deletions"
 
 def _has_value(value: Any) -> bool:
@@ -153,6 +158,41 @@ def plugin_id_from_url(url: str) -> str:
     if not clean:
         return ""
     return clean.split("/")[-1]
+
+def normalize_plugin_types(value: Any) -> List[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = value
+    elif value is None:
+        values = []
+    else:
+        values = [str(value)]
+    cleaned = []
+    seen = set()
+    for item in values:
+        if not isinstance(item, str):
+            item = str(item)
+        item = item.strip().lower()
+        if not item or item not in PLUGIN_TYPE_CHOICES or item in seen:
+            continue
+        seen.add(item)
+        cleaned.append(item)
+    return cleaned or ["app"]
+
+def merge_plugin_types(primary: Any, secondary: Any) -> List[str]:
+    primary_types = normalize_plugin_types(primary)
+    secondary_types = normalize_plugin_types(secondary)
+    if primary_types == ["app"] and secondary_types != ["app"]:
+        return secondary_types
+    if secondary_types == ["app"]:
+        return primary_types
+    merged = []
+    for item in primary_types + secondary_types:
+        if item not in merged:
+            merged.append(item)
+    return merged or ["app"]
+
 def auto_install_and_enable_default_plugins(manager: 'PluginManager', wgp_globals: dict):
     server_config = wgp_globals.get("server_config")
     server_config_filename = wgp_globals.get("server_config_filename")
@@ -218,12 +258,21 @@ class PluginTab:
     component_constructor: callable
     position: int = -1
 
+@dataclass
+class PluginModelExtension:
+    plugin_id: str
+    plugin_path: str
+    model_handlers: List[str]
+    defaults_root: str
+    profiles_root: str
+
 class WAN2GPPlugin:
     def __init__(self):
         self.tabs: Dict[str, PluginTab] = {}
         self.name = self.__class__.__name__
         self.version = "1.0.0"
         self.description = "No description provided."
+        self.type = ["app"]
         self.uninstallable = True
         self._component_requests: List[str] = []
         self._global_requests: List[str] = []
@@ -310,6 +359,7 @@ class PluginManager:
         self.local_catalog_path = os.path.join(self.repo_root, PLUGIN_LOCAL_CATALOG_FILENAME)
         self.server_config: Optional[Dict[str, Any]] = None
         self.server_config_filename: str = ""
+        self._plugin_metadata_cache: Dict[str, tuple[Optional[int], Optional[Dict[str, Any]]]] = {}
 
     def set_server_config(self, server_config: Optional[Dict[str, Any]], server_config_filename: str = "") -> None:
         self.server_config = server_config if isinstance(server_config, dict) else None
@@ -417,6 +467,22 @@ class PluginManager:
                 return False
         return default
 
+    def _coerce_string_list(self, value: Any) -> List[str]:
+        if isinstance(value, str):
+            values = [value]
+        elif isinstance(value, list):
+            values = value
+        else:
+            return []
+        cleaned = []
+        for item in values:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if text:
+                cleaned.append(text)
+        return cleaned
+
     def _load_json_file(self, path: str) -> Optional[Any]:
         if not path or not os.path.isfile(path):
             return None
@@ -452,10 +518,26 @@ class PluginManager:
 
     def _load_plugin_metadata(self, plugin_path: str) -> Optional[Dict[str, Any]]:
         metadata_path = os.path.join(plugin_path, PLUGIN_METADATA_FILENAME)
+        try:
+            mtime_ns = os.stat(metadata_path).st_mtime_ns
+        except FileNotFoundError:
+            mtime_ns = None
+        except Exception as e:
+            print(f"[PluginManager] Failed to stat {metadata_path}: {e}")
+            mtime_ns = None
+        cached = self._plugin_metadata_cache.get(metadata_path)
+        if cached is not None and cached[0] == mtime_ns:
+            return dict(cached[1]) if cached[1] is not None else None
         payload = self._load_json_file(metadata_path)
         if not isinstance(payload, dict):
+            self._plugin_metadata_cache[metadata_path] = (mtime_ns, None)
             return None
-        return self._normalize_plugin_metadata(payload)
+        metadata = self._normalize_plugin_metadata(payload)
+        self._plugin_metadata_cache[metadata_path] = (mtime_ns, dict(metadata))
+        return dict(metadata)
+
+    def _invalidate_plugin_metadata_cache(self, plugin_path: str) -> None:
+        self._plugin_metadata_cache.pop(os.path.join(plugin_path, PLUGIN_METADATA_FILENAME), None)
 
     def _normalize_plugin_metadata(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         metadata = dict(payload)
@@ -472,7 +554,18 @@ class PluginManager:
             metadata["wan2gp_version"] = str(legacy_version).strip()
         metadata.pop("wangp_version", None)
         metadata["url"] = ""
+        metadata["type"] = normalize_plugin_types(metadata.get("type"))
         metadata["uninstallable"] = self._coerce_bool(metadata.get("uninstallable"), default=True)
+        metadata[PLUGIN_SPATIAL_UPSAMPLER_HANDLERS_KEY] = self._coerce_string_list(metadata.get(PLUGIN_SPATIAL_UPSAMPLER_HANDLERS_KEY))
+        metadata[PLUGIN_MODEL_HANDLERS_KEY] = self._coerce_string_list(metadata.get(PLUGIN_MODEL_HANDLERS_KEY))
+        for key in (PLUGIN_MODEL_DEFAULTS_KEY, PLUGIN_MODEL_PROFILES_KEY):
+            value = metadata.get(key)
+            if isinstance(value, str):
+                metadata[key] = value.strip()
+            elif value is None:
+                metadata[key] = ""
+            else:
+                metadata[key] = str(value)
         return metadata
 
     def _apply_metadata_to_plugin(self, plugin: WAN2GPPlugin, metadata: Optional[Dict[str, Any]], is_system: bool) -> None:
@@ -483,12 +576,116 @@ class PluginManager:
         for key in ("name", "version", "description", "author", "date", "wan2gp_version"):
             if key in metadata:
                 setattr(plugin, key, metadata.get(key))
+        if "type" in metadata:
+            plugin.type = normalize_plugin_types(metadata.get("type"))
         if not _has_value(getattr(plugin, "wan2gp_version", "")) and _has_value(metadata.get("wangp_version")):
             setattr(plugin, "wan2gp_version", str(metadata.get("wangp_version")).strip())
         if "uninstallable" in metadata:
             plugin.uninstallable = self._coerce_bool(metadata.get("uninstallable"), default=True)
         if is_system:
             plugin.uninstallable = False
+
+    def _resolve_plugin_class_path(self, plugin_id: str, handler_path: str, label: str = "handler") -> Optional[str]:
+        text = str(handler_path or "").strip()
+        if not text:
+            return None
+        is_relative = text.startswith(".")
+        if ":" in text:
+            module_path, class_name = text.rsplit(":", 1)
+        else:
+            if "." not in text:
+                print(f"[PluginManager] Invalid {label} path for plugin {plugin_id}: {handler_path}")
+                return None
+            module_path, class_name = text.rsplit(".", 1)
+        module_path = module_path.strip().replace("\\", "/")
+        if module_path.endswith(".py"):
+            module_path = module_path[:-3]
+        module_path = module_path.replace("/", ".")
+        if is_relative:
+            module_path = module_path.lstrip(".")
+        module_path = module_path.strip(".")
+        class_name = class_name.strip()
+        if not module_path or not class_name:
+            print(f"[PluginManager] Invalid {label} path for plugin {plugin_id}: {handler_path}")
+            return None
+        full_module_path = f"{plugin_id}.{module_path}" if is_relative else module_path
+        return f"{full_module_path}.{class_name}"
+
+    def _resolve_plugin_module_path(self, plugin_id: str, module_path: str, label: str = "module") -> Optional[str]:
+        text = str(module_path or "").strip()
+        if not text:
+            return None
+        is_relative = text.startswith(".")
+        text = text.replace("\\", "/")
+        if text.endswith(".py"):
+            text = text[:-3]
+        if is_relative:
+            text = text.lstrip(".").lstrip("/")
+        text = text.strip("/").replace("/", ".").strip(".")
+        if not text:
+            print(f"[PluginManager] Invalid {label} path for plugin {plugin_id}: {module_path}")
+            return None
+        return f"{plugin_id}.{text}" if is_relative else text
+
+    def _resolve_plugin_folder_path(self, plugin_path: str, path_value: str) -> str:
+        path_text = str(path_value or "").strip()
+        if not path_text:
+            return ""
+        path_text = path_text.replace("\\", os.sep).replace("/", os.sep)
+        if os.path.isabs(path_text):
+            return os.path.abspath(path_text)
+        if path_text.startswith("."):
+            return os.path.abspath(os.path.join(plugin_path, path_text))
+        return os.path.abspath(path_text)
+
+    def discover_plugin_model_extensions(self, enabled_plugins: List[str]) -> List[PluginModelExtension]:
+        enabled = set(enabled_plugins or []) | set(SYSTEM_PLUGINS)
+        extensions = []
+        for plugin_id in self.discover_plugins():
+            if plugin_id not in enabled:
+                continue
+            plugin_path = os.path.join(self.plugins_dir, plugin_id)
+            metadata = self._load_plugin_metadata(plugin_path)
+            if not metadata:
+                continue
+            handlers = metadata.get(PLUGIN_MODEL_HANDLERS_KEY, [])
+            if not handlers:
+                continue
+            defaults_root = self._resolve_plugin_folder_path(plugin_path, metadata.get(PLUGIN_MODEL_DEFAULTS_KEY, ""))
+            profiles_root = self._resolve_plugin_folder_path(plugin_path, metadata.get(PLUGIN_MODEL_PROFILES_KEY, ""))
+            if not defaults_root or not profiles_root:
+                print(f"[PluginManager] Plugin {plugin_id} declares model handlers but is missing '{PLUGIN_MODEL_DEFAULTS_KEY}' or '{PLUGIN_MODEL_PROFILES_KEY}' in {PLUGIN_METADATA_FILENAME}.")
+                continue
+            handler_paths = []
+            for handler_path in handlers:
+                resolved_path = self._resolve_plugin_module_path(plugin_id, handler_path, label="model handler")
+                if resolved_path is not None:
+                    handler_paths.append(resolved_path)
+            if not handler_paths:
+                continue
+            extensions.append(PluginModelExtension(plugin_id, plugin_path, handler_paths, defaults_root, profiles_root))
+            print(f"[PluginManager] Loaded model plugin: {metadata.get('name') or plugin_id} (from {plugin_id})")
+        return extensions
+
+    def _register_plugin_spatial_upsamplers(self, plugin_id: str, metadata: Optional[Dict[str, Any]], files_locator=None) -> None:
+        if not metadata:
+            return
+        handlers = metadata.get(PLUGIN_SPATIAL_UPSAMPLER_HANDLERS_KEY, [])
+        if not handlers:
+            return
+        handler_paths = []
+        for handler_path in handlers:
+            resolved_path = self._resolve_plugin_class_path(plugin_id, handler_path, label="spatial upsampler handler")
+            if resolved_path is not None:
+                handler_paths.append(resolved_path)
+        if not handler_paths:
+            return
+        try:
+            from postprocessing import upsamplers as upsampler_api
+            upsampler_api.register_spatial_upsamplers(self.server_config, files_locator, handler_paths)
+        except Exception as e:
+            print(f"[PluginManager] Error registering spatial upsamplers for plugin {plugin_id}: {e}")
+            traceback.print_exc()
 
     def _normalize_catalog_entry(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         entry = dict(payload)
@@ -512,6 +709,7 @@ class PluginManager:
         if not _has_value(entry.get("wan2gp_version")) and _has_value(legacy_version):
             entry["wan2gp_version"] = str(legacy_version).strip()
         entry.pop("wangp_version", None)
+        entry["type"] = normalize_plugin_types(entry.get("type"))
         return entry
 
     def _merge_entry_fields(self, primary: Dict[str, Any], secondary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -519,6 +717,9 @@ class PluginManager:
         if not secondary:
             return result
         for key, value in secondary.items():
+            if key == "type":
+                result[key] = merge_plugin_types(result.get(key), value)
+                continue
             if _has_value(result.get(key)):
                 continue
             if _has_value(value):
@@ -552,8 +753,10 @@ class PluginManager:
                 comparison = compare_release_metadata(local_entry, base_entry)
                 if comparison > 0:
                     merged_entry = dict(local_entry)
+                    merged_entry["type"] = merge_plugin_types(local_entry.get("type"), base_entry.get("type"))
                 else:
                     merged_entry = dict(base_entry)
+                    merged_entry["type"] = merge_plugin_types(base_entry.get("type"), local_entry.get("type"))
                     if _has_value(local_entry.get("last_check")):
                         merged_entry["last_check"] = local_entry.get("last_check")
                 merged[plugin_id] = merged_entry
@@ -617,13 +820,13 @@ class PluginManager:
 
     def _metadata_to_catalog_entry(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         entry = {}
-        for key in ("name", "author", "version", "description", "date", "wan2gp_version"):
+        for key in ("name", "author", "version", "description", "type", "date", "wan2gp_version"):
             entry[key] = metadata.get(key, "")
         return self._normalize_catalog_entry(entry)
 
     def _extract_catalog_metadata(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         payload = {}
-        for key in ("name", "author", "version", "description", "url", "date", "wan2gp_version"):
+        for key in ("name", "author", "version", "description", "type", "url", "date", "wan2gp_version"):
             payload[key] = entry.get(key, "")
         return self._normalize_catalog_entry(payload)
 
@@ -672,6 +875,7 @@ class PluginManager:
                 "author": info.get("author", ""),
                 "version": info.get("version", ""),
                 "description": info.get("description", ""),
+                "type": info.get("type", ["app"]),
                 "url": info.get("url", ""),
                 "date": info.get("date", ""),
                 "wan2gp_version": info.get("wan2gp_version", ""),
@@ -760,6 +964,7 @@ class PluginManager:
                     "version": plugin_info.get("version", ""),
                     "description": plugin_info.get("description", ""),
                     "author": plugin_info.get("author", ""),
+                    "type": plugin_info.get("type", ["app"]),
                     "url": plugin_info.get("url", ""),
                     "date": plugin_info.get("date", ""),
                     "wan2gp_version": plugin_info.get("wan2gp_version", ""),
@@ -812,7 +1017,7 @@ class PluginManager:
             return f"[Warning] Catalog merged, but failed to remove {self.local_catalog_path}: {e}"
         return "[Success] Catalog merged and local overrides removed."
 
-    def get_plugins_info(self) -> List[Dict[str, str]]:
+    def get_plugins_info(self) -> List[Dict[str, Any]]:
         plugins_info = []
         for dir_name in self.discover_plugins():
             plugin_path = os.path.join(self.plugins_dir, dir_name)
@@ -823,6 +1028,7 @@ class PluginManager:
                 'version': 'N/A',
                 'description': 'No description provided.',
                 'author': '',
+                'type': ['app'],
                 'url': '',
                 'date': '',
                 'wan2gp_version': '',
@@ -836,6 +1042,7 @@ class PluginManager:
                 info['version'] = metadata.get('version', info['version'])
                 info['description'] = metadata.get('description', info['description'])
                 info['author'] = metadata.get('author', info['author'])
+                info['type'] = normalize_plugin_types(metadata.get('type', info['type']))
                 info['url'] = metadata.get('url', info['url'])
                 info['date'] = metadata.get('date', info['date'])
                 info['wan2gp_version'] = metadata.get('wan2gp_version', info['wan2gp_version'])
@@ -849,6 +1056,7 @@ class PluginManager:
                             info['name'] = instance.name
                             info['version'] = instance.version
                             info['description'] = instance.description
+                            info['type'] = normalize_plugin_types(getattr(instance, 'type', info['type']))
                             info['uninstallable'] = bool(getattr(instance, 'uninstallable', True))
                             break
                 except Exception as e:
@@ -1028,7 +1236,11 @@ class PluginManager:
             git.Repo.clone_from(cleaned_url, target_dir)
 
             plugin_entry = os.path.join(target_dir, "plugin.py")
-            if not os.path.isfile(plugin_entry):
+            metadata = self._load_plugin_metadata(target_dir)
+            metadata_handlers = []
+            if metadata:
+                metadata_handlers = metadata.get(PLUGIN_MODEL_HANDLERS_KEY, []) + metadata.get(PLUGIN_SPATIAL_UPSAMPLER_HANDLERS_KEY, [])
+            if not os.path.isfile(plugin_entry) and not metadata_handlers:
                 shutil.rmtree(target_dir, onerror=self._remove_readonly)
                 return "[Error] Invalid Plugin."
 
@@ -1086,6 +1298,7 @@ class PluginManager:
             try:
                 with open(metadata_path, "w", encoding="utf-8") as writer:
                     json.dump(payload, writer, indent=2, ensure_ascii=True)
+                self._invalidate_plugin_metadata_cache(plugin_dir)
             except Exception as e:
                 print(f"[PluginManager] Failed to update {metadata_path}: {e}")
 
@@ -1097,7 +1310,7 @@ class PluginManager:
                 discovered.append(item)
         return sorted(discovered)
 
-    def load_plugins_from_directory(self, enabled_user_plugins: List[str], safe_mode: bool = False) -> None:
+    def load_plugins_from_directory(self, enabled_user_plugins: List[str], safe_mode: bool = False, files_locator=None) -> None:
         self.custom_js_snippets = []
         if safe_mode:
             print("[Safe Mode] User plugins are disabled. Only system plugins will be loaded.")
@@ -1109,10 +1322,14 @@ class PluginManager:
             if plugin_dir_name not in plugins_to_load:
                 continue
             try:
-                module = importlib.import_module(f"{plugin_dir_name}.plugin")
                 plugin_path = os.path.join(self.plugins_dir, plugin_dir_name)
                 metadata = self._load_plugin_metadata(plugin_path)
                 is_bundled = plugin_dir_name in BUNDLED_PLUGINS
+                if not os.path.isfile(os.path.join(plugin_path, "plugin.py")):
+                    self._register_plugin_spatial_upsamplers(plugin_dir_name, metadata, files_locator=files_locator)
+                    continue
+
+                module = importlib.import_module(f"{plugin_dir_name}.plugin")
 
                 for name, obj in inspect.getmembers(module, inspect.isclass):
                     if issubclass(obj, WAN2GPPlugin) and obj != WAN2GPPlugin:
@@ -1128,6 +1345,7 @@ class PluginManager:
                             if hook_name not in self.data_hooks:
                                 self.data_hooks[hook_name] = []
                             self.data_hooks[hook_name].extend(callbacks)
+                        self._register_plugin_spatial_upsamplers(plugin_dir_name, metadata, files_locator=files_locator)
                         if plugin_dir_name not in SYSTEM_PLUGINS:
                             print(f"Loaded plugin: {plugin.name} (from {plugin_dir_name})")
                         break
@@ -1286,13 +1504,7 @@ class WAN2GPApplication:
             return
         self.plugin_manager.set_server_config(server_config, server_config_filename)
         if not safe_mode:
-            try:
-                migration = importlib.import_module("wan2gp-configuration.defaults_migration")
-                migrate_mediaflow_plugin_id = getattr(migration, "migrate_mediaflow_plugin_id", None)
-                if callable(migrate_mediaflow_plugin_id):
-                    migrate_mediaflow_plugin_id(server_config, server_config_filename)
-            except Exception as e:
-                print(f"[PluginManager] Warning: failed to migrate MediaFlow plugin id: {e}")
+            migrate_mediaflow_plugin_id(server_config, server_config_filename)
         if not safe_mode and not server_config.get("motion_designer_bundled_migrated", 0):
             server_config["enabled_plugins"] = server_config.get("enabled_plugins", []) + ([] if "wan2gp-motion-designer" in server_config.get("enabled_plugins", []) else ["wan2gp-motion-designer"]); server_config["motion_designer_bundled_migrated"] = 1
             self.plugin_manager._save_server_config()
@@ -1300,7 +1512,7 @@ class WAN2GPApplication:
 
         self.enabled_plugins = server_config.get("enabled_plugins", [])
 
-        self.plugin_manager.load_plugins_from_directory(self.enabled_plugins, safe_mode=safe_mode)
+        self.plugin_manager.load_plugins_from_directory(self.enabled_plugins, safe_mode=safe_mode, files_locator=wgp_globals.get("fl"))
         self.plugin_manager.inject_globals(wgp_globals)
 
     def setup_ui_tabs(self, main_tabs_component: gr.Tabs, state_component: gr.State, set_save_form_event):
