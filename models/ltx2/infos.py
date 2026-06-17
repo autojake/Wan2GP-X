@@ -97,3 +97,26 @@ Filename rule: it contains "id-lora-celebvhq"
 Result: the reference voice workflow uses your ID-LoRA file and weight.
 ```
 """
+
+LTX2_MSR_INFOS = """
+# LTX2 Multiple Subject Reference
+
+This model is configured for the LiconStudio Multiple Subject Reference LoRA. It uses reference images only; Control Video, pose, depth, canny, HDR, outpainting, masks, and frame injection are disabled for this workflow.
+
+## Reference Image Order
+
+Use one of the `MSR Reference Images` modes:
+
+- `Background + Up to 4 Subjects`: upload 2 to 5 images. Image 1 is the background or scene reference; images 2 to 5 are the subject or object references to preserve.
+- `Subjects / Objects only`: upload 1 to 4 subject or object references on a plain white or neutral background.
+
+In `Background + Up to 4 Subjects` mode, WanGP internally reorders the references before denoising so the MSR LoRA receives the subject references first and the background reference last, matching the upstream MSR convention. In `Subjects / Objects only` mode, WanGP keeps the uploaded reference order unchanged.
+
+## Reference Image Preparation
+
+Subject or object references work best on a plain white background. If your non-background references are not already isolated on white, keep `Remove Background behind MSR Subjects / Objects` enabled so WanGP removes the subject background and places it on white.
+
+Character sheets are recommended for character references: use an image that shows the same character from several points of view, poses, or close-up/detail angles. This gives MSR more identity and clothing information than a single portrait.
+
+Use the text prompt to describe how the referenced subjects should appear together in the referenced environment.
+"""
