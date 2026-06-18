@@ -540,15 +540,16 @@ class family_handler:
                     control_choices += [("Convert SDR to HDR (IC-LoRA)", f"V&G")]
                 control_choices += [("Inject Frames", "KFI")]
             control_choices_image = [(label, value) for label, value in control_choices if value not in ("OVG", "KFI", "V&G")]
-            guide_custom_choices = {
-                "choices": control_choices,
-                "letters_filter": f"OPDEVG&KFI",
-                "default": "VGI" if editanything_ref else "",
-                "label": "Control Video / Frames Injection",
-                "visible": not editanything_ref and not msr,
-            }
-            extra_model_def["guide_custom_choices"] = guide_custom_choices
-            extra_model_def["guide_custom_choices_image"] = {**guide_custom_choices, "choices": control_choices_image, "label": "Control Image"}
+            if not msr:
+                guide_custom_choices = {
+                    "choices": control_choices,
+                    "letters_filter": f"OPDEVG&KFI",
+                    "default": "VGI" if editanything_ref else "",
+                    "label": "Control Video / Frames Injection",
+                    "visible":  not editanything_ref  ,
+                }
+                extra_model_def["guide_custom_choices"] = guide_custom_choices
+                extra_model_def["guide_custom_choices_image"] = {**guide_custom_choices, "choices": control_choices_image, "label": "Control Image"}
             extra_model_def["custom_frames_injection"] = True
             extra_model_def["one_image_ref_only"] = True
             if editanything_ref:
@@ -560,7 +561,7 @@ class family_handler:
                         "ltx2_msr": True,
                         "image_prompt_types_allowed": "TE",
                         "image_ref_choices": {
-                            "choices": [("Background + Up to 4 Subjects", "KI"), ("Subjects / Objects only", "I")],
+                            "choices": [("Up to 5 Subjects / Objects", "I"), ("Background + Up to 4 Subjects", "KI")],
                             "letters_filter": "KI",
                             "default": "KI",
                             "label": "MSR Reference Images",
