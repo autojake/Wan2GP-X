@@ -54,6 +54,7 @@ LTX2_OUTPAINT_GAMMA = 2.0
 LTX2_HDR_TRANSFORM = "logc3"
 LTX2_DISABLE_STAGE2_WITH_CONTROL_VIDEO = True
 LTX2_ENABLE_EMBEDDING_LORAS = False
+LTX2_VAE_TEMPORAL_TILING_FPS = 24.0
 LTX2_EMBEDDING_LORA_PREFIXES = (
     "text_embedding_projection.",
     "feature_extractor_linear.",
@@ -353,11 +354,15 @@ def _attach_lora_preprocessor(transformer: torch.nn.Module) -> None:
                 continue
             if module_name not in module_names:
                 prefixed_name = f"velocity_model.{module_name}"
-                if prefixed_name in module_names:
+                if module_name.endswith(".to_out") and f"{prefixed_name}.0" in module_names:
+                    module_name = f"{prefixed_name}.0"
+                elif prefixed_name in module_names:
                     module_name = prefixed_name
                 else:
                     dropped_keys.append(original_key)
                     continue
+            elif module_name.endswith(".to_out") and f"{module_name}.0" in module_names:
+                module_name = f"{module_name}.0"
             new_sd[f"{module_name}{suffix}"] = value
         if dropped_keys:
             sample = ", ".join(dropped_keys[:8])
@@ -517,7 +522,7 @@ def _build_tiling_config(tile_size: int | tuple | list | None, fps: float | None
     temporal_config = None
     if fps is not None and fps > 0:
         temporal_tiling_divisor = max(1, temporal_tiling_divisor)
-        tile_frames = _normalize_temporal_tiling_size(int(math.ceil(float(fps) * 5.0 / temporal_tiling_divisor)))
+        tile_frames = _normalize_temporal_tiling_size(int(math.ceil(LTX2_VAE_TEMPORAL_TILING_FPS * 5.0 / temporal_tiling_divisor)))
         if tile_frames > 0:
             overlap_frames = int(round(tile_frames * 3 / 8))
             overlap_frames = _normalize_temporal_overlap(overlap_frames, tile_frames)
@@ -1072,7 +1077,6 @@ class LTX2:
     ):
         if self._interrupt:
             return None
-        image_mode = int(image_mode or 0)
         joyai_context = None
         joyai_memory_bank = None
         joyai_store_mem_selectors = []
@@ -1085,6 +1089,10 @@ class LTX2:
         distill = self.model_def.get("ltx2_pipeline", "two_stage") == "distilled"
         editanything = _is_editanything_model(self.model_def)
         msr = self.model_def.get("ltx2_msr", False)
+        output_frame_num = frame_num
+        if msr and "I" in video_prompt_type and input_ref_images is not None:
+            frame_num = max(frame_num, self.model_def.get("ltx2_msr_frame_count", 0))
+
         hdr_enabled = self.base_model_type == "ltx2_22B" and VIDEO_PROMPT_HDR_OUTPUT_FLAG in video_prompt_type
         input_video_is_hdr = bool(input_video_is_hdr)
         hdr_scene_context = self._load_hdr_scene_context(lora_dir) if hdr_enabled else None
@@ -1266,7 +1274,7 @@ class LTX2:
             images_stage2.append(entry)
 
         if image_end is not None:
-            entry = (image_end, int(frame_num - 1), input_video_strength)
+            entry = (image_end, output_frame_num - 1, input_video_strength)
             guiding_images.append(entry)
             guiding_images_stage2.append(entry)
 
@@ -1554,7 +1562,7 @@ class LTX2:
         if video_tensor is None:
             return None
 
-        video_tensor = video_tensor[:, :frame_num, :height, :width]
+        video_tensor = video_tensor[:, :output_frame_num, :height, :width]
         if use_outpaint_gamma_roundtrip:
             if torch.is_inference(video_tensor):
                 raise RuntimeError("LTX2 decoded video output is still an inference tensor; decode_video_to_tensor must allocate the output buffer outside inference mode.")
