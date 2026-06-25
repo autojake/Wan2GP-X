@@ -11,12 +11,12 @@ from shared.attention import pay_attention
 
 
 def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
-    scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim
+    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
     omega = 1.0 / ((theta * ntk) ** scale)
-    out = torch.einsum("...n,d->...nd", pos.float(), omega)
+    out = torch.einsum("...n,d->...nd", pos, omega)
     out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
     out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
-    return out
+    return out.float()
 
 
 def _apply_rope_inplace(x: Tensor, freqs: Tensor) -> Tensor:
@@ -53,7 +53,7 @@ def attention(qkv_list: list[Tensor], mask: Tensor | None = None, scale: float |
         k = rearrange(k, "B G R L D -> (B G R) L 1 D")
         v = rearrange(v, "B G R L D -> (B G R) L 1 D")
         if mask is not None:
-            mask = mask.expand(groups * repeat, -1, -1, -1) if batch == 1 else mask.repeat_interleave(groups * repeat, dim=0)
+            mask = mask.repeat_interleave(groups * repeat, dim=0).contiguous() if batch > 1 else mask.expand(groups * repeat, -1, -1, -1)
         qkv_list = [q, k, v]
         q = k = v = None
         out = pay_attention(qkv_list, attention_mask=mask, softmax_scale=scale, recycle_q=True)
@@ -350,7 +350,8 @@ class SingleStreamDiT(nn.Module):
             pos = F.pad(pos, (0, 0, 0, padlen))
         mask = key_padding_mask(mask)
         if freqs is None:
-            freqs = self.posemb(pos).to(combined.dtype)
+            freqs = self.posemb(pos)
+            freqs = freqs.to(combined.dtype)
         return combined, txtlen, imglen, freqs, mask
 
     def forward(self, img: Tensor, context: Tensor, t: Tensor, pos: Tensor, mask: Tensor | None = None) -> Tensor:
