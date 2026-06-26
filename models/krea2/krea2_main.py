@@ -72,34 +72,38 @@ class Qwen3VLConditioner(torch.nn.Module):
         self.prompt_template_encode_start_idx = 34
         self.prompt_template_encode_suffix_start_idx = 5
 
-    @property
-    def device(self):
-        return next(self.qwen.parameters()).device
-
-    @torch.inference_mode()
-    def forward(self, text: list[str]):
-        self.qwen.language_model._interrupt = getattr(self, "_interrupt", False)
-        if getattr(self, "_interrupt", False):
-            return None, None
+    def _tokenize(self, text: list[str], device):
         prefix_idx = self.prompt_template_encode_start_idx
-        text = [self.prompt_template_encode_prefix + item for item in text]
+        target_device = torch.device(device)
+        prefixed_text = [self.prompt_template_encode_prefix + item for item in text]
         suffix_text = [self.prompt_template_encode_suffix] * len(text)
-        suffix_inputs = self.processor(text=suffix_text, return_tensors="pt").to(self.device, non_blocking=True)
+        # Tokenizers create PyTorch tensors via the global default device; pin that choice here so MMGP
+        # offload state cannot make token tensors bounce through CPU with an unsafe async copy.
+        with torch.device(target_device):
+            suffix_inputs = self.processor(text=suffix_text, return_tensors="pt").to(target_device)
+            inputs = self.tokenizer(
+                prefixed_text,
+                truncation=True,
+                return_length=False,
+                return_overflowing_tokens=False,
+                padding="max_length",
+                max_length=self.max_length + prefix_idx - self.prompt_template_encode_suffix_start_idx,
+                return_tensors="pt",
+            ).to(target_device)
         suffix_ids = suffix_inputs["input_ids"]
         suffix_mask = suffix_inputs["attention_mask"].bool()
-        inputs = self.tokenizer(
-            text,
-            truncation=True,
-            return_length=False,
-            return_overflowing_tokens=False,
-            padding="max_length",
-            max_length=self.max_length + prefix_idx - self.prompt_template_encode_suffix_start_idx,
-            return_tensors="pt",
-        ).to(self.device, non_blocking=True)
         input_ids = torch.cat([inputs["input_ids"], suffix_ids], dim=1)
         mask = torch.cat([inputs["attention_mask"].bool(), suffix_mask], dim=1)
         position_ids = mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(mask == 0, 1)
+        return input_ids, mask, position_ids, prefix_idx
+
+    @torch.inference_mode()
+    def forward(self, text: list[str], device):
+        self.qwen.language_model._interrupt = getattr(self, "_interrupt", False)
+        if getattr(self, "_interrupt", False):
+            return None, None
+        input_ids, mask, position_ids, prefix_idx = self._tokenize(text, device=device)
         selected_layers = [layer_idx - 1 for layer_idx in self.select_layers]
         states = self.qwen.language_model(input_ids=input_ids, attention_mask=mask, position_ids=position_ids, use_cache=False, return_mid_results_layers=selected_layers)
         if states.last_hidden_state is None:
@@ -115,6 +119,22 @@ class Qwen3VLConditioner(torch.nn.Module):
 
 class _TextEncodingInterrupted(Exception):
     pass
+
+
+def _lora_schedules_are_static_for_modules(model, prefixes):
+    scaling = getattr(model, "_loras_scaling", None)
+    if not scaling:
+        return True
+    dynamic_adapters = {name for name, values in scaling.items() if isinstance(values, list) and any(value != values[0] for value in values[1:])}
+    if not dynamic_adapters:
+        return True
+    shortcuts = getattr(model, "_loras_model_shortcuts", None)
+    if not shortcuts:
+        return True
+    for module_name, loras_data in shortcuts.items():
+        if module_name.startswith(prefixes) and any(adapter in loras_data for adapter in dynamic_adapters):
+            return False
+    return True
 
 
 class Krea2Pipeline:
@@ -148,7 +168,7 @@ class Krea2Pipeline:
         self.encoder.qwen.language_model._interrupt = self._interrupt
 
         def encode_fn(prompt_batch):
-            hiddens, masks = self.encoder(prompt_batch)
+            hiddens, masks = self.encoder(prompt_batch, device=device)
             if hiddens is None:
                 raise _TextEncodingInterrupted
             return [(hiddens[i], masks[i]) for i in range(len(prompt_batch))]
@@ -176,7 +196,7 @@ class Krea2Pipeline:
         batch_size = len(prompts)
         noise = torch.empty(batch_size, self.channels, height // self.compression, width // self.compression, device=device, dtype=dtype)
         for i in range(batch_size):
-            noise[i].copy_(torch.randn(self.channels, height // self.compression, width // self.compression, device=device, dtype=dtype, generator=torch.Generator(device=device).manual_seed(int(seed) + i)))
+            noise[i]= torch.randn(self.channels, height // self.compression, width // self.compression, device=device, dtype=dtype, generator=torch.Generator(device=device).manual_seed(int(seed) + i))
         txt, txtmask = self._encode_prompts(prompts, device, dtype)
         if txt is None:
             return None
@@ -196,20 +216,54 @@ class Krea2Pipeline:
             callback(-1, None, True, override_num_inference_steps=steps)
         from shared.utils.loras_mutipliers import update_loras_slists
         update_loras_slists(self.transformer, loras_slists, steps)
+        context_static = _lora_schedules_are_static_for_modules(self.transformer, ("txtfusion.", "txtmlp."))
+        timestep_static = _lora_schedules_are_static_for_modules(self.transformer, ("tmlp.", "tproj."))
+        if context_static:
+            offload.set_step_no_for_lora(self.transformer, 0)
+            self.transformer._interrupt = self._interrupt
+            txt_list = [txt]
+            txt = None
+            txt = self.transformer.prepare_context(txt_list, mask)
+            if txt is None:
+                return None
+            if cfg:
+                untxt_list = [untxt]
+                untxt = None
+                untxt = self.transformer.prepare_context(untxt_list, unmask)
+                if untxt is None:
+                    return None
+        t_values = torch.tensor(ts[:-1], dtype=img.dtype, device=img.device)
+        if timestep_static:
+            offload.set_step_no_for_lora(self.transformer, 0)
+            t_all, tvec_all = self.transformer.prepare_timestep(t_values)
+            step_tensors = tuple((t_all[i : i + 1], tvec_all[i : i + 1]) for i in range(steps))
+        else:
+            step_tensors = []
+            for step_no, tcurr in enumerate(t_values):
+                offload.set_step_no_for_lora(self.transformer, step_no)
+                step_tensors.append(self.transformer.prepare_timestep(tcurr[None]))
+        torch.cuda.empty_cache()
         for i, (tcurr, tprev) in enumerate(tqdm(list(zip(ts[:-1], ts[1:])), total=steps)):
             offload.set_step_no_for_lora(self.transformer, i)
             self.transformer._interrupt = self._interrupt
             if self._interrupt:
                 return None
-            t = torch.full((len(img),), tcurr, dtype=img.dtype, device=img.device)
+            t, tvec = step_tensors[i]
             if cfg:
-                cond, uncond = self.transformer.forward_cfg(img=img, context=txt, uncond_context=untxt, t=t, pos=pos, uncond_pos=unpos, mask=mask, uncond_mask=unmask)
+                step_txt = txt if context_static else self.transformer.prepare_context(txt, mask)
+                step_untxt = untxt if context_static else self.transformer.prepare_context(untxt, unmask)
+                if step_txt is None or step_untxt is None:
+                    return None
+                cond, uncond = self.transformer.forward_cfg(img=img, context=step_txt, uncond_context=step_untxt, t=t, tvec=tvec, pos=pos, uncond_pos=unpos, mask=mask, uncond_mask=unmask)
                 if cond is None or uncond is None:
                     return None
                 v = cond + guidance * (cond - uncond)
                 del uncond
             else:
-                cond = self.transformer(img=img, context=txt, t=t, pos=pos, mask=mask)
+                step_txt = txt if context_static else self.transformer.prepare_context(txt, mask)
+                if step_txt is None:
+                    return None
+                cond = self.transformer(img=img, context=step_txt, t=t, tvec=tvec, pos=pos, mask=mask)
                 if cond is None:
                     return None
                 v = cond
