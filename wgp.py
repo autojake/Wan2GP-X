@@ -318,7 +318,7 @@ def _open_image_input(image):
     if not isinstance(image, str):
         return image
     virtual_image = get_virtual_image(image)
-    return virtual_image if virtual_image is not None else Image.open(image)
+    return virtual_image if virtual_image is not None else Image.open(strip_virtual_media_suffix(image))
 
 def is_integer(n):
     try:
@@ -6527,14 +6527,17 @@ def generate_media(
 
     if image_guide is not None:
         if isinstance(image_guide, str): 
-            image_guide = Image.open(image_guide)
+            image_guide = _open_image_input(image_guide)
         if isinstance(image_guide, Image.Image):
             video_guide = image_guide
             image_guide = None
 
-    if image_mask is not None and isinstance(image_mask, Image.Image):
-        video_mask = image_mask
-        image_mask = None
+    if image_mask is not None:
+        if isinstance(image_mask, str):
+            image_mask = _open_image_input(image_mask)
+        if isinstance(image_mask, Image.Image):
+            video_mask = image_mask
+            image_mask = None
 
     if model_def.get("no_background_removal", False): remove_background_images_ref = 0
     
@@ -9895,6 +9898,9 @@ def _model_choice_target_value(model_type):
     caller = inspect.currentframe().f_back.f_code.co_name
     model_dropdowns.debug_model_selector_event("target.write", source=caller, target=model_type)
     return gr.update() if len(model_type) == 0 else f"{model_type}|{time.time()}"
+
+def switch_to_model(model_type, open_media_tab=False):
+    return _model_choice_target_value(model_type), gr.Tabs(selected="media_gen") if open_media_tab else gr.update()
 
 def goto_model_type(state, model_type):
     model_type = _model_choice_target_model_type(model_type)
