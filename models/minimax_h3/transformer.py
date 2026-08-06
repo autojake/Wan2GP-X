@@ -136,7 +136,7 @@ class MLP(nn.Module):
         x = _take(x_list)
         chunk_size = self.chunk_size
         if chunk_size > 0:
-            chunk_size = min(chunk_size, max(1, x.shape[0] * self.hidden // (2 * self.ffn)))
+            chunk_size = max(1, x.shape[0] * self.hidden // (2 * self.ffn))
         if chunk_size <= 0 or x.shape[0] <= chunk_size:
             return self._project([x])
         for start in range(0, x.shape[0], chunk_size):
@@ -165,25 +165,29 @@ class Attention(nn.Module):
             key = self.k_norm(self.k_proj(x).view(1, seq_len, self.heads, self.head_dim))
             value = self.v_proj(x).view(1, seq_len, self.heads, self.head_dim)
         else:
-            qkv = self.qkv_proj(x).view(seq_len, self.heads, 3, self.head_dim)
-            query, key, value = qkv.unbind(dim=2)
+            qkv = self.qkv_proj(x)
+            query, key, value = qkv.split(self.heads * self.head_dim, dim=-1)
+            query = query.view(seq_len, self.heads, self.head_dim)
+            key = key.view(seq_len, self.heads, self.head_dim)
+            value = value.view(seq_len, self.heads, self.head_dim)
             query, key, value = query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0).clone()
             del qkv
         del x
         if not hasattr(self, "q_proj"):
             query, key = self.q_norm(query), self.k_norm(key)
+        qkv_list = [query, key, value]
+        del query, key, value
         if rope is not None:
             pairs = rope.shape[-2]
             cosine, sine = rope[..., 0], rope[..., 1]
-            for tensor in (query, key):
+            scratch = torch.empty_like(qkv_list[0][..., :pairs])
+            for index in range(2):
+                tensor = qkv_list[index]
                 first, second = tensor[..., :pairs], tensor[..., pairs:2 * pairs]
-                first_out = first * cosine - second * sine
-                second_out = second * cosine + first * sine
-                first.copy_(first_out)
-                second.copy_(second_out)
-                del first_out, second_out
-        qkv_list = [query, key, value]
-        del query, key, value
+                scratch.copy_(first)
+                first.mul_(cosine).addcmul_(second, sine, value=-1)
+                second.mul_(cosine).addcmul_(scratch, sine)
+            del scratch, tensor, first, second
         output = pay_attention(qkv_list, recycle_q=True).reshape(seq_len, -1)
         return self.out_proj(output)
 
