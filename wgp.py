@@ -52,6 +52,7 @@ import copy
 import numpy as np
 import importlib
 from models import model_metadata
+from shared import notifications
 from shared.utils import notification_sound
 from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_loras_multipliers
 from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_uint8_chunked, save_image, get_video_info, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, image_editor_layer_to_rgb_mask, to_rgb_tensor, get_resampled_video_transparent, get_video_summary_extras
@@ -88,6 +89,7 @@ from shared.utils import files_locator as fl
 from shared.gradio.audio_gallery import AudioGallery  
 from shared.utils.self_refiner import normalize_self_refiner_plan, ensure_refiner_list, add_refiner_rule, remove_refiner_rule
 from shared.deepy import controller as deepy_controller
+from shared.deepy import filesystem as deepy_filesystem
 from shared.deepy import cli as deepy_cli
 from shared.deepy import gradio_ui as deepy_gradio_ui
 from shared import extra_settings
@@ -127,7 +129,7 @@ from shared.ffmpeg_setup import download_ffmpeg
 from shared.api import apply_video_length_duration, get_api_output_options, store_api_output_artifact
 from shared.utils.plugins import PluginManager, WAN2GPApplication, SYSTEM_PLUGINS
 from shared.llm_engines.nanovllm.vllm_support import resolve_lm_decoder_engine
-from shared.gradio import assistant_chat, field_help, finetune_editor, local_file_picker, model_infos, model_output_filter, model_selector_toolbar
+from shared.gradio import assistant_chat, field_help, finetune_editor, gallery_files, local_file_picker, model_infos, model_output_filter, model_selector_toolbar
 from shared.gradio.magic_mask import MagicMaskUI
 from shared import model_dropdowns
 from shared import settings_metadata
@@ -144,8 +146,6 @@ MagicMaskUI.patch_image_editor()
 # dynamo.config.accumulated_recompile_limit = 2000  # or whatever limit you want
 
 STARTUP_LOCK_FILE = "startup.lock"
-PHASE_2_TILING_VIDEO_PROMPT_FLAG = "~"
-PHASE_2_TILING_GUIDANCE_VALUE = "2~"
 global_queue_ref = []
 AUTOSAVE_FILENAME = "queue.zip"
 AUTOSAVE_PATH = AUTOSAVE_FILENAME
@@ -154,7 +154,7 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.14"
-WanGP_version = "12.64"
+WanGP_version = "12.643"
 settings_version = 2.75
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -163,6 +163,8 @@ CUSTOM_SETTINGS_MAX = 5
 CUSTOM_SETTINGS_PER_ROW = 2
 CUSTOM_SETTING_DROPDOWN_MAX = 5
 CUSTOM_SETTING_TYPES = {"int", "float", "text", "dropdown"}
+PHASE_2_TILING_VIDEO_PROMPT_FLAG = "~"
+PHASE_2_TILING_GUIDANCE_VALUE = "2~"
 lm_decoder_engine = ""
 enable_int8_kernels = 0
 theme_text_size = Size("8.1px", "9px", "10.8px", "12.6px", "14.4px", "19.8px", "23.4px", name="wangp_text_90")
@@ -2625,6 +2627,7 @@ if not Path(config_load_filename).is_file():
         "prompt_enhancer_top_p": 0.9,
         "prompt_enhancer_randomize_seed": True,
         "audio_save_path": "outputs",
+        **notifications.default_config(),
     }
 
     with open(server_config_filename, "w", encoding="utf-8") as writer:
@@ -2635,6 +2638,7 @@ else:
     server_config = json.loads(text)
 
 server_config.setdefault("prompt_enhancer_quantization", "quanto_int8")
+notifications.apply_defaults(server_config)
 server_config.setdefault(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT)
 server_config[LLM_CONFIG_KEY] = normalize_llm_config(server_config)
 server_config["multi_prompts_gen_type"] = prompt_parser.normalize_multi_prompts_mode(
@@ -5847,8 +5851,7 @@ def edit_media(
                 **kwargs
                 ):
 
-
-
+    operation_start_time = time.time()
     gen = get_gen_info(state)
     api_return_video_uint8, api_return_audio = get_api_output_options(plugin_data)
     api_options = plugin_data.get("api", {}) if isinstance(plugin_data, dict) and isinstance(plugin_data.get("api", {}), dict) else {}
@@ -6005,6 +6008,7 @@ def edit_media(
                 image_paths.append(save_image(img, save_file=img_path, quality=server_config.get("image_output_codec", None)))
             video_path = image_paths if len(image_paths) > 1 else image_paths[0]
             print(f"Postprocessed image saved to Path: {video_path}")
+            configs["generation_time"] = round(time.time() - operation_start_time)
             record_file_metadata(video_path, configs, True, False, gen)
             if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache:
                 store_api_output_artifact(gen, client_id, video_path, "image", sample if api_return_video_uint8 else None, None, None, None)
@@ -6036,6 +6040,7 @@ def edit_media(
         gen["total_generation"] = total_generation         
         if repeat_no >= total_generation: break
         repeat_no +=1
+        repeat_start_time = operation_start_time if repeat_no == 1 else time.time()
         gen["repeat_no"] = repeat_no
         suffix =  "" if "_post" in video_source else "_post"
 
@@ -6124,6 +6129,7 @@ def edit_media(
             new_video_path = video_path
 
         if any_change:
+            configs["generation_time"] = round(time.time() - repeat_start_time)
             if mode == "edit_remux":
                 print(f"Remuxed Video saved to Path: "+ new_video_path)
             else:
@@ -6142,6 +6148,7 @@ def edit_media(
                 save_video_metadata(new_video_path, configs, embedded_images, allow_inplace_update=True, verbose_level=verbose_level)
                 if temp_images_path is not None and os.path.isdir(temp_images_path):
                     shutil.rmtree(temp_images_path, ignore_errors= True)
+            notifications.record_generation(server_config, gen, new_video_path, configs)
             if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache:
                 store_api_output_artifact(
                     gen,
@@ -6164,6 +6171,7 @@ def edit_media(
 
 
 def edit_audio(send_cmd, state, audio_source, postprocess_audio, replace_voice_sample, replace_voice_sample2, client_id="", plugin_data=None):
+    operation_start_time = time.time()
     gen = get_gen_info(state)
     api_return_video_uint8, api_return_audio = get_api_output_options(plugin_data)
     if gen.get("abort", False):
@@ -6202,6 +6210,7 @@ def edit_audio(send_cmd, state, audio_source, postprocess_audio, replace_voice_s
     )
     configs["postprocess_audio"] = postprocess_audio
     configs["audio_postprocess"] = audio_processor_api.format_method_label(postprocess_audio)
+    configs["generation_time"] = round(time.time() - operation_start_time)
 
     print("Postprocessed audio saved to Path: " + new_audio_path)
     record_file_metadata(new_audio_path, configs, False, True, gen)
@@ -6620,8 +6629,10 @@ def get_output_filepath(file_path, is_image, audio_only):
     return get_available_filename(base_path, file_path)
 
 
-def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=None, replace_last_file=False):
-    return shared_record_file_metadata(video_path, configs, is_image, audio_only, gen, get_processed_queue=get_processed_queue, metadata_choice=server_config.get("metadata_type", "metadata"), embedded_images=embedded_images, replace_last_file=replace_last_file, lock=lock, verbose_level=verbose_level)
+def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=None, replace_last_file=False, notify_generation=True, write_metadata=True, record_notification=True):
+    shared_record_file_metadata(video_path, configs, is_image, audio_only, gen, get_processed_queue=get_processed_queue, metadata_choice=server_config.get("metadata_type", "metadata"), embedded_images=embedded_images, replace_last_file=replace_last_file, lock=lock, verbose_level=verbose_level, write_metadata=write_metadata)
+    if record_notification:
+        notifications.record_generation(server_config, gen, video_path, configs, replace_last=replace_last_file, notify=notify_generation)
 
 
 def generate_media(
@@ -7054,6 +7065,7 @@ def generate_media(
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
     gen_state = {}
     frame_scheduler = None
+    first_window_available_overlap = estimate_first_window_overlap_frames(None if fake_start_image else image_start, video_source, keep_frames_video_source, fps)
     scheduler_supported = frame_scheduler_supported(model_type, model_def, image_mode)
     if not scheduler_supported and has_slash_commands(prompts):
         raise gr.Error("Prompt slash window commands require a video model with Sliding Window support.")
@@ -7072,7 +7084,7 @@ def generate_media(
             preserve_exact_output_frames=model_def.get("image_end_frame_position", False),
             supported_model_commands=model_def.get("prompt_slash_commands", []),
             allow_new_shot=image_prompt_types_allow_t2v(model_def, image_mode),
-            first_window_overlap_frames=estimate_first_window_overlap_frames(None if fake_start_image else image_start, video_source, keep_frames_video_source, fps),
+            first_window_overlap_frames=first_window_available_overlap,
             discard_last_frames=sliding_window_discard_last_frames,
         )
         if frame_scheduler_error is not None:
@@ -7167,7 +7179,6 @@ def generate_media(
     full_audio_guide_waveform, full_audio_guide_sample_rate = None, 0
     control_video_trim = not model_def.get("control_video_trim_disabled", False) and (model_def.get("control_video_trim", False) or "|" in video_prompt_type)
 
-    if test_any_sliding_window(model_type) and video_source is not None: current_video_length +=  sliding_window_overlap - 1
     if audio_guide != None:
         from preprocessing.extract_vocals import get_vocals
         import librosa
@@ -7252,10 +7263,12 @@ def generate_media(
     if scheduler_active:
         default_windows_template = []
     elif any_sliding_window:
-        default_windows_template = build_default_window_plan(total_frames=current_video_length, window_size=sliding_window_size, default_overlap=default_reuse_frames, discard_last_frames=sliding_window_discard_last_frames, minimum=frames_minimum, step=frames_steps, frame_offset=frames_offset, overlap_offset=sliding_window_defaults.get("overlap_offset", 1), max_overlap=sliding_window_defaults.get("overlap_max"), preserve_exact_output_frames=model_def.get("image_end_frame_position", False))
+        default_windows_template = build_default_window_plan(total_frames=current_video_length, window_size=sliding_window_size, default_overlap=default_reuse_frames, discard_last_frames=sliding_window_discard_last_frames, minimum=frames_minimum, step=frames_steps, frame_offset=frames_offset, overlap_offset=sliding_window_defaults.get("overlap_offset", 1), max_overlap=sliding_window_defaults.get("overlap_max"), first_window_overlap=default_reuse_frames if video_source is not None else 0, first_window_available_overlap=first_window_available_overlap if video_source is not None else None, preserve_exact_output_frames=model_def.get("image_end_frame_position", False))
     else:
         default_windows_template = [{"output_frames": current_video_length, "overlap_frames": 0, "discard_last_frames": 0, "trim_last_frames": 0, "frame_num": current_video_length}]
     default_windows = [dict(window) for window in default_windows_template]
+    if not scheduler_active:
+        sliding_window = len(default_windows) > 1 or default_windows[0]["overlap_frames"] > 0
     seed = set_seed(seed)
 
     torch.set_grad_enabled(False) 
@@ -7407,7 +7420,7 @@ def generate_media(
                 reuse_frames, current_video_length, discard_last_frames = default_window["overlap_frames"], default_window["frame_num"], default_window["discard_last_frames"]
                 automatic_trim_last_frames = default_window["trim_last_frames"]
                 prompt =  prompts[window_no] if window_no < len(prompts) else prompts[-1]
-                sliding_window = len(default_windows) > 1
+                sliding_window = len(default_windows) > 1 or reuse_frames > 0
             gen["sliding_window"] = sliding_window
             current_alt_prompt = alt_prompts[window_no] if window_no < len(alt_prompts) else alt_prompts[-1]
             if scheduler_active:
@@ -8344,7 +8357,8 @@ def generate_media(
                 configs["creation_date"] = datetime.fromtimestamp(end_time).isoformat(timespec="seconds")
                 configs["creation_timestamp"] = int(end_time)
                 # if sample_is_image: configs["is_image"] = True
-                record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=embedded_images, replace_last_file=sliding_window and window_no > 1 and not server_config.get("keep_intermediate_sliding_windows", 1))
+                keep_intermediate_windows = server_config.get("keep_intermediate_sliding_windows", 1)
+                record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=embedded_images, replace_last_file=sliding_window and window_no > 1 and not keep_intermediate_windows, notify_generation=not sliding_window or keep_intermediate_windows or window_no == total_windows)
                 if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache:
                     media_type = "audio" if audio_only else ("image" if is_image else "video")
                     artifact_audio = output_new_audio_data if api_return_audio else None
@@ -8498,6 +8512,7 @@ def process_tasks(state):
                 gen["process_status"] = None
 
     start_time = time.time()
+    notification_run = notifications.start_queue(gen, len(queue))
 
     global gen_in_progress
     gen_in_progress = True
@@ -8569,6 +8584,7 @@ def process_tasks(state):
 
                 abort = gen.get("abort", False)
                 if abort:
+                    notification_run.interrupt("Generation aborted by the user.", aborted=True)
                     record_queue_error(state, queue[:1], "abort", abort=True)
                     gen["abort"] = False
                     send_cmd("status", "Video Generation Aborted")
@@ -8576,13 +8592,17 @@ def process_tasks(state):
 
                 gen["early_stop"] = False
                 gen["early_stop_forwarded"] = False
-                if not success: break
+                if not success:
+                    notification_run.interrupt("Generation stopped before the queue completed.")
+                    break
                 with lock:
                     queue[:] = [item for item in queue if item['id'] != task_id]
+                notification_run.task_completed()
                 update_global_queue_ref(queue)
                 
         except Exception as e:
             traceback.print_exc()
+            notification_run.fail(str(e))
             send_cmd("error", f"Queue worker crashed: {e}")
         finally:
             send_cmd("worker_exit", None)
@@ -8598,6 +8618,7 @@ def process_tasks(state):
         elif cmd == "info":
             gr.Info(data)
         elif cmd == "error": 
+            notification_run.fail(str(data))
             record_queue_error(state, queue, data)
             queue.clear()
             try:
@@ -8616,6 +8637,7 @@ def process_tasks(state):
             gen["prompts_max"] = 0
             gen["prompt"] = ""
             gen["status_display"] =  False
+            notifications.finish_queue(server_config, gen, notification_run, time.time() - start_time)
             release_gen()
             raise gr.Error(data, print_exception= False, duration = 0)
         elif cmd == "status":
@@ -8650,8 +8672,11 @@ def process_tasks(state):
     gen["prompt"] = ""
     end_time = time.time()
     if gen.get("abort", False):
-        record_queue_error(state, queue[:1], "abort", abort=True)
-        status = f"Video generation was aborted. Total Generation Time: {format_time(end_time-start_time)}" 
+        notification_run.interrupt("Generation aborted by the user.", aborted=True)
+    if notification_run.interrupted:
+        if notification_run.aborted:
+            record_queue_error(state, queue[:1], "abort", abort=True)
+        status = f"Queue processing was interrupted. Total Generation Time: {format_time(end_time-start_time)}"
     else:
         status = f"Total Generation Time: {format_time(end_time-start_time)}"
         try:
@@ -8660,6 +8685,7 @@ def process_tasks(state):
                 notification_sound.notify_video_completion(volume=volume)
         except Exception as e:
             print(f"Error playing notification sound: {e}")
+    notifications.finish_queue(server_config, gen, notification_run, end_time - start_time)
     gen["status"] = status
     gen["status_display"] =  False
     release_gen()
@@ -8755,7 +8781,9 @@ def process_tasks_cli(queue, state):
     total_tasks = len(queue)
     completed = 0
     skipped = 0
+    failed = 0
     start_time = time.time()
+    notification_run = notifications.start_queue(gen, total_tasks)
 
     for task_idx, task in enumerate(queue):
         task_no = task_idx + 1
@@ -8767,6 +8795,7 @@ def process_tasks_cli(queue, state):
         if validated_params is None:
             print(f"  [SKIP] Task {task_no} failed validation: {validation_error or 'Task failed validation.'}")
             skipped += 1
+            notification_run.task_skipped()
             continue
 
         # Update gen state for this task
@@ -8847,7 +8876,11 @@ def process_tasks_cli(queue, state):
 
         if not task_error:
             completed += 1
+            notification_run.task_completed()
             print(f"\n  Task {task_no} completed")
+        else:
+            failed += 1
+            notification_run.task_failed()
 
     elapsed = time.time() - start_time
     print(f"\n{'='*50}")
@@ -8855,6 +8888,7 @@ def process_tasks_cli(queue, state):
     if skipped > 0:
         summary += f" ({skipped} skipped)"
     print(summary)
+    notifications.finish_queue(server_config, gen, notification_run, elapsed)
     return completed == (total_tasks - skipped)
 
 
@@ -13373,6 +13407,7 @@ def create_ui():
     if not args.lock_model:
         transformer_type = model_dropdowns.select_model_for_output_filter(_get_dropdown_deps(), server_config, transformer_type)
     gradio_downloads.install_routes()
+    gallery_files.install(deepy_filesystem.build_file_access_policy(server_config))
     # Load CSS from external file
     css_path = os.path.join(os.path.dirname(__file__), "shared", "gradio", "ui_styles.css")
     with open(css_path, "r", encoding="utf-8") as f:

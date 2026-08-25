@@ -86,8 +86,8 @@ class family_handler:
             "image_ref_choices": {
                 "choices": [
                     ("Generate without Reference Images", ""),
-                    ("Use Reference Images", "I"),
                     ("First Reference Image is the Main Subject / Landscape, defines Output Dimensions, and may be followed by other Reference Images", "KI"),
+                    ("Use Reference Images", "I"),
                 ],
                 "letters_filter": "KI",
                 "default": "KI",
@@ -130,7 +130,7 @@ class family_handler:
                 "info": "Disabled retains only compact prompt/reference K/V and builds the active layer's attention workspace on demand. Enabled preallocates full per-layer K/V buffers for faster denoising.",
             }],
             "profiles_dir": [_PROFILE_FOLDER],
-            "resolutions_categories": ["<=4k"],
+            "resolutions_categories": ["<=4096p"],
             "skip_prompt_template": True,
             "vae_block_size": 32,
         }
@@ -229,6 +229,6 @@ class family_handler:
             "guidance_scale": 4.0,
             "flow_shift": 3.0,
             "batch_size": 1,
-            "video_prompt_type": "KI",
+            "video_prompt_type": "",
             "custom_settings": {_KV_CACHE_SETTING: "Disabled"},
         })
