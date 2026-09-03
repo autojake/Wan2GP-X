@@ -58,3 +58,5 @@ loras_url_cache.json
 wheels/
 
 Light*
+
+uv.lock
