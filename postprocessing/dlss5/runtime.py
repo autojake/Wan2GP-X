@@ -16,6 +16,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from mmgp import offload
+from shared.utils import offload_registry
 
 
 RUNTIME = Path(__file__).resolve().parents[2] / "dlss5"
@@ -51,11 +53,18 @@ MOTION_VECTOR_METHODS = ("original", "raft")
 RAFT_ITERATIONS = 20
 _RAFT_MODELS = {}
 _DEPTH_MODELS = {}
+_GUIDE_OFFLOADS = {}
 
 
 def configure_depth_estimator(server_config):
     global DEPTH_MODEL_VARIANT
     DEPTH_MODEL_VARIANT = server_config.get("depth_anything_v2_variant", "vitl")
+
+
+def _offload_guide_model(name, model):
+    offloadobj = offload.profile({"model": model}, profile_no=3, quantizeTransformer=False, convertWeightsFloatTo=None, pinnedMemory=False, verboseLevel=-1)
+    _GUIDE_OFFLOADS[name] = offloadobj
+    offload_registry.register_offloadobj(name, offloadobj, release_flow_model)
 
 
 def _raft_model(device: torch.device):
@@ -67,11 +76,17 @@ def _raft_model(device: torch.device):
         model = RAFT(argparse.Namespace(small=False, mixed_precision=False, alternate_corr=False))
         weights = torch.load(fl.locate_file("flow/raft-things.pth"), map_location="cpu", weights_only=True)
         model.load_state_dict({name.removeprefix("module."): value for name, value in weights.items()})
-        _RAFT_MODELS[key] = model.to(device).eval()
+        _RAFT_MODELS[key] = model.eval()
+        if device.type == "cuda":
+            _offload_guide_model("DLSS Motion Vectors", model)
     return _RAFT_MODELS[key]
 
 
 def release_flow_model():
+    for name, offloadobj in _GUIDE_OFFLOADS.items():
+        offload_registry.unregister_offloadobj(name, offloadobj)
+        offloadobj.release()
+    _GUIDE_OFFLOADS.clear()
     for annotator in _DEPTH_MODELS.values():
         if hasattr(annotator, "close"):
             annotator.close()
@@ -90,12 +105,14 @@ def _depth_model(device: torch.device):
         if variant == "da3_metric_large":
             from preprocessing.depth_anything_v3.depth import DepthV3VideoAnnotator
 
-            _DEPTH_MODELS[key] = DepthV3VideoAnnotator({"PRETRAINED_MODEL": fl.locate_file("depth/depth_anything_v3_metric_large_bf16.safetensors"), "MODEL_NAME": "da3metric-large", "PROCESS_RES": 0, "CHUNK_SIZE": 1, "CHUNK_OVERLAP": 8}, device=device)
+            _DEPTH_MODELS[key] = DepthV3VideoAnnotator({"PRETRAINED_MODEL": fl.locate_file("depth/depth_anything_v3_metric_large_bf16.safetensors"), "MODEL_NAME": "da3metric-large", "PROCESS_RES": 0, "CHUNK_SIZE": 1, "CHUNK_OVERLAP": 8}, device=torch.device("cpu"))
         else:
             from preprocessing.depth_anything_v2.depth import DepthV2Annotator
 
             filename = f"depth/depth_anything_v2_{variant}.pth"
-            _DEPTH_MODELS[key] = DepthV2Annotator({"PRETRAINED_MODEL": fl.locate_file(filename), "MODEL_VARIANT": variant}, device=device)
+            _DEPTH_MODELS[key] = DepthV2Annotator({"PRETRAINED_MODEL": fl.locate_file(filename), "MODEL_VARIANT": variant}, device=torch.device("cpu"))
+        if device.type == "cuda":
+            _offload_guide_model(f"DLSS Depth ({variant})", _DEPTH_MODELS[key].model)
     return _DEPTH_MODELS[key]
 
 
@@ -110,7 +127,7 @@ def dlssg_capabilities() -> dict:
     try:
         result = subprocess.run([str(DLSSG_WORKER), "--probe"], cwd=str(DLSSG_DIR), capture_output=True, text=True, timeout=15, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         capabilities = json.loads(result.stdout.strip())
-        return capabilities if result.returncode == 0 and capabilities.get("available") else {}
+        return capabilities if isinstance(capabilities, dict) and "available" in capabilities else {}
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return {}
 
@@ -132,17 +149,17 @@ def is_rtx_50_series() -> bool:
 
 
 @lru_cache(maxsize=1)
-def _hags_enabled() -> bool:
+def _hags_enabled() -> bool | None:
     if os.name != "nt":
-        return False
+        return None
     try:
         import winreg
 
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers") as key:
             value, _kind = winreg.QueryValueEx(key, "HwSchMode")
-        return int(value) == 2
+        return {1: False, 2: True}.get(int(value))
     except (OSError, ValueError):
-        return False
+        return None
 
 
 def unavailable_reason(*, temporal: bool) -> str:
@@ -155,8 +172,13 @@ def unavailable_reason(*, temporal: bool) -> str:
     minimum = 40 if temporal else 30
     if series < minimum:
         return f"RTX {minimum}+ required"
-    if temporal and not _hags_enabled():
-        return "HAGS disabled"
+    if temporal:
+        hags_enabled = _hags_enabled()
+        if hags_enabled is False:
+            return "HAGS disabled"
+        capabilities = dlssg_capabilities()
+        if capabilities and not capabilities["available"]:
+            return "DLSS Frame Generation unavailable (check HAGS and NVIDIA driver)"
     return ""
 
 
@@ -202,6 +224,21 @@ class Worker:
 
     def error(self) -> str:
         return "\n".join(self.logs)
+
+    def read_exact(self, size: int, operation: str) -> bytes:
+        assert self.process.stdout is not None
+        try:
+            return _read_exact(self.process.stdout, size)
+        except (OSError, RuntimeError) as error:
+            self.close(abort=True)
+            code = self.process.returncode
+            code_text = "unknown" if code is None else f"{code} (0x{code & 0xFFFFFFFF:08X})"
+            details = self.error()
+            if code is not None and (code & 0xFFFFFFFF) == 0xC0000135:
+                details = f"Windows could not load a DLL dependency. Install the current DLSS 5 worker bundle.\n{details}".rstrip()
+            elif not details:
+                details = "The worker produced no diagnostic output. Reinstall the current DLSS 5 worker bundle and verify dlss5/host/ReShade.log."
+            raise RuntimeError(f"{operation}: {Path(self.process.args[0]).name} exited before replying (exit code {code_text}).\n{details}") from error
 
     def close(self, *, abort: bool = False):
         process = self.process
@@ -372,14 +409,14 @@ class NeuralRenderingSession(Worker):
             self.process.stdin.write(struct.pack("<14I4f", self.VIDEO_MAGIC, width, height, output_width, output_height, 0, frames, perf_quality, 0, 0, 0, 0, 0, 0, intensity, 1.0, 1.0, -1.0))
         self.process.stdin.flush()
         if USE_DEPTH_GUIDE:
-            response = struct.unpack("<6I", _read_exact(self.process.stdout, struct.calcsize("<6I")))
+            response = struct.unpack("<6I", self.read_exact(struct.calcsize("<6I"), "DLSS Neural Rendering setup"))
             if response[0] != self.DEPTH_SETUP_MAGIC or response[1]:
                 self.close(abort=True)
                 raise RuntimeError(f"DLSS Neural Rendering depth setup failed (NGX 0x{response[1]:08X}).\n{self.error()}")
             self.render_width, self.render_height = response[2], response[3]
             negotiated_output = response[4], response[5]
         else:
-            response = struct.unpack("<12I", _read_exact(self.process.stdout, struct.calcsize("<12I")))
+            response = struct.unpack("<12I", self.read_exact(struct.calcsize("<12I"), "DLSS Neural Rendering setup"))
             if response[0] != self.SETUP_MAGIC or not response[1]:
                 self.close(abort=True)
                 raise RuntimeError(f"DLSS Neural Rendering setup failed (NGX 0x{response[2]:08X}).\n{self.error()}")
@@ -399,7 +436,7 @@ class NeuralRenderingSession(Worker):
                 raise ValueError("DLSS Neural Rendering depth mode requires a depth guide")
             self.process.stdin.write(memoryview(np.ascontiguousarray(depth, dtype=np.float32)).cast("B"))
         self.process.stdin.flush()
-        magic, out_index, ok, byte_count, ngx_result, _pts = struct.unpack("<5Iq", _read_exact(self.process.stdout, struct.calcsize("<5Iq")))
+        magic, out_index, ok, byte_count, ngx_result, _pts = struct.unpack("<5Iq", self.read_exact(struct.calcsize("<5Iq"), f"DLSS Neural Rendering frame {index}"))
         expected = self.output_width * self.output_height * 4
         if magic != self.OUT_MAGIC or out_index != index or not ok or byte_count != expected or ngx_result != 1:
             raise RuntimeError(f"DLSS Neural Rendering failed on frame {index} (NGX 0x{ngx_result:08X}).\n{self.error()}")
@@ -410,29 +447,35 @@ def neural_render(sample: torch.Tensor, scale: float, *, still_image: bool, dept
     require_runtime(temporal=False)
     dtype, device, channels, frame_count, height, width = _sample_info(sample)
     session = NeuralRenderingSession(width, height, frame_count, scale, intensity)
-    output = np.empty((frame_count, session.output_height, session.output_width, 4), dtype=np.uint8)
+    completed = False
     try:
+        output = np.empty((frame_count, session.output_height, session.output_width, 4), dtype=np.uint8)
         flow_guides = None if still_image else FlowGuides(session.render_width, session.render_height, motion_vector)
         zero_motion = np.zeros((session.render_height, session.render_width, 2), dtype=np.float16) if still_image else None
         depth_guides = DepthGuides(session.render_width, session.render_height, depth_resolution) if USE_DEPTH_GUIDE else None
         for index in range(frame_count):
             if abort_callback is not None and abort_callback():
-                session.close(abort=True)
                 return None
             frame = _frame_to_rgba(sample, index)
             render_frame = frame if (width, height) == (session.render_width, session.render_height) else cv2.resize(frame, (session.render_width, session.render_height), interpolation=cv2.INTER_LANCZOS4)
             motion, reset = (zero_motion, True) if still_image else flow_guides.process(render_frame)
             depth = depth_guides.process(render_frame, reset) if depth_guides is not None else None
+            if abort_callback is not None and abort_callback():
+                return None
             processed = session.process_frame(index, render_frame, motion, reset, output[index], depth=depth)
             if channels == 4:
                 processed[..., 3] = cv2.resize(frame[..., 3], (session.output_width, session.output_height), interpolation=cv2.INTER_LANCZOS4)
             if progress_callback is not None:
                 progress_callback("DLSS 5 Neural Rendering", index + 1, frame_count)
             del frame, render_frame, motion, depth, processed
-        session.close()
-    except Exception:
-        session.close(abort=True)
-        raise
+        if abort_callback is not None and abort_callback():
+            return None
+        completed = True
+    finally:
+        try:
+            session.close(abort=not completed)
+        finally:
+            offload_registry.unload_vram(list(_GUIDE_OFFLOADS))
     return _from_rgba_frames(output, dtype, device, channels)
 
 
@@ -449,7 +492,7 @@ class FrameGenerationSession(Worker):
         assert self.process.stdin is not None and self.process.stdout is not None
         self.process.stdin.write(struct.pack("<5I", self.SETUP_MAGIC, width, height, max(1, frames), generated_count))
         self.process.stdin.flush()
-        magic, status, maximum, _reserved = struct.unpack("<4I", _read_exact(self.process.stdout, struct.calcsize("<4I")))
+        magic, status, maximum, _reserved = struct.unpack("<4I", self.read_exact(struct.calcsize("<4I"), "DLSS Frame Generation setup"))
         if magic != self.SETUP_OUT_MAGIC or status or maximum < generated_count:
             self.close(abort=True)
             raise RuntimeError(f"DLSS Frame Generation {generated_count + 1}x setup failed (status {status}, runtime maximum {maximum + 1}x).\n{self.error()}")
@@ -460,7 +503,7 @@ class FrameGenerationSession(Worker):
         self.process.stdin.write(memoryview(np.ascontiguousarray(rgba, dtype=np.uint8)).cast("B"))
         self.process.stdin.write(memoryview(np.ascontiguousarray(motion, dtype=np.float16)).cast("B"))
         self.process.stdin.flush()
-        magic, status, generated, disabled = struct.unpack("<4I", _read_exact(self.process.stdout, struct.calcsize("<4I")))
+        magic, status, generated, disabled = struct.unpack("<4I", self.read_exact(struct.calcsize("<4I"), f"DLSS Frame Generation frame {index}"))
         if magic != self.FRAME_OUT_MAGIC or status:
             raise RuntimeError(f"DLSS Frame Generation failed on frame {index} (status {status}).\n{self.error()}")
         if disabled or generated == 0:
@@ -477,12 +520,12 @@ class FrameGenerationSession(Worker):
 def _interpolate(frame_count: int, width: int, height: int, frame_getter, fps: float, scale: int, motion_vector: str, abort_callback=None, progress_callback=None) -> np.ndarray | None:
     generated_count = scale - 1
     session = FrameGenerationSession(width, height, frame_count, generated_count)
-    guides = FlowGuides(width, height, motion_vector)
-    output = np.empty(((frame_count - 1) * scale + 1, height, width, 4), dtype=np.uint8)
+    completed = False
     try:
+        guides = FlowGuides(width, height, motion_vector)
+        output = np.empty(((frame_count - 1) * scale + 1, height, width, 4), dtype=np.uint8)
         for index in range(frame_count):
             if abort_callback is not None and abort_callback():
-                session.close(abort=True)
                 return None
             frame = frame_getter(index)
             motion, reset = guides.process(frame)
@@ -498,10 +541,14 @@ def _interpolate(frame_count: int, width: int, height: int, frame_getter, fps: f
             if progress_callback is not None:
                 progress_callback("DLSS Frame Generation", index + 1, frame_count)
             del frame, motion
-        session.close()
-    except Exception:
-        session.close(abort=True)
-        raise
+        if abort_callback is not None and abort_callback():
+            return None
+        completed = True
+    finally:
+        try:
+            session.close(abort=not completed)
+        finally:
+            offload_registry.unload_vram(list(_GUIDE_OFFLOADS))
     return output
 
 
