@@ -109,6 +109,11 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
     def enabled(self) -> bool:
         return True
 
+    def query_chunking(self, spatial_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from .process_handler import HANDLER, REFINER_HANDLER
+        return REFINER_HANDLER if self.split_value(spatial_upsampling)[0] == REFINE_METHOD else HANDLER
+
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         split = self.split_value(spatial_upsampling)
         if image_mode:
@@ -118,6 +123,12 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
         if split is None or split[0] not in MODEL_TYPES or split[1] != 2.0:
             return "LTX video upsampling only supports x2"
         return ""
+
+    def query_checkpoint_inventory(self):
+        from .runtime import LORA_KEYS
+        for label, method in self.METHODS:
+            model = MODEL_TYPES[method]
+            yield {"name": "LTX", "variant": label.removeprefix("LTX "), "model_types": [model], "model_lora_keys": {model: LORA_KEYS[method]}}
 
     def download(self, process_files: Callable[..., Any], send_cmd=None, status_text: str | None = None, spatial_upsampling=None) -> bool:
         split = self.split_value(spatial_upsampling)

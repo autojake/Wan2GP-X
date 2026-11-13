@@ -68,7 +68,7 @@ HELPERS = {
 RULES = [
     "Save finished deliverables under out/ (PNG/JPG/WEBP images, WAV/FLAC/MP3 audio, OBJ/PLY/STL/GLTF/GLB meshes; clips through wangp.publish_video): after the run each one is published to the Gallery and returned in outputs with a media_id (at most 8 per run; more means frames, which are not published). A mesh is converted to GLB, given a rendered preview and placed in the 3D gallery, where render_3d_views and inspect_media work on it; write OBJ from numpy (v x y z and f a b c lines, 1-based) for procedural props, terrains and extrusions. Other files under out/ (SRT, JSON, CSV, SVG, TXT) are returned in files with their @documents path for other tools. Everything else under the sandbox (tmp/, work files, frame sequences, comparison or debug images) is scratch and stays private: published files cannot be deleted afterwards.",
     "Write files only with relative paths inside the sandbox ('scratch/face.png', 'out/poster.png', 'tmp/frames'): other folders (/tmp, C:\\...) are refused, and C libraries such as OpenCV fail silently there (cv2.imwrite returns False), so check their result. Other tools (inspect_media, the toolbox) reach a sandbox file as @documents/sandbox/<relative path>; wangp.inspect and wangp.toolbox accept the relative path directly.",
-    "The sandbox folder is the working directory: use relative paths ('out/poster.png', 'tmp/frames'). Read Gallery media or @documents files through wangp.path(ref) (images: PIL.Image.open(wangp.path('image_3'))). Other paths are refused, and nothing outside the sandbox can be written.",
+    "The sandbox folder is the working directory: use relative paths ('out/poster.png', 'tmp/frames'). Read Gallery media or @documents files through wangp.path(ref) (images: PIL.Image.open(wangp.path('visual:IMAGE'))). Other paths are refused, and nothing outside the sandbox can be written.",
     "No GPU, raw network, processes or ffmpeg: compute, draw and compose here; generate media with WanGP's models; cut, mix, merge and inspect with the toolbox; reach the web through wangp.download / wangp.web when web search is enabled.",
     "Keep one run to one step (a trailing expression is returned as result, print() as stdout); state persists between runs, so build up gradually; restart after a broken state.",
     f"Loops over many files belong in Python with wangp.call: list a folder with wangp.listdir, call wangp.inspect / wangp.toolbox / wangp.generate per item, report each item with wangp.progress(i, len(items), name) as it starts, collect the results in a list and print only the summary or the matches you need (each call is a real tool call with its full cost, at most {MAX_TOOL_CALLS} per run; time inside the tools does not count toward timeout_s, so no checkpoint files or split runs are needed for long loops; the run result reports the calls made; if the user presses Stop the script stops at its next tool call, print or wangp.progress and keeps its variables, so keep results in a list or dict as you go and read them in the next run). Tools that write files, browse the web, manage sessions or run Python are not callable from scripts.",
@@ -80,7 +80,7 @@ ACTIONS = {
             "code": {"type": "string", "minLength": 1, "description": "Python source. Start with a `# title` comment naming what the code makes: it becomes the description of published media."},
             "timeout_s": {"type": "number", "minimum": 1, "default": DEFAULT_TIMEOUT_S, "description": f"Seconds of the script's own computing before it is killed (larger values are capped at {MAX_TIMEOUT_S}; time inside WanGP's tools does not count). Does not extend the separate {STARTUP_TIMEOUT_S}-second worker startup limit."},
         }, "required": ["code"], "additionalProperties": False},
-        "example": {"action": "run", "arguments": {"code": "# Poster title\nfrom PIL import Image, ImageDraw\nimg = Image.open(wangp.path('image_1')).convert('RGB')\nd = ImageDraw.Draw(img)\nd.text((60, 40), 'BLUE HOUR', font=wangp.font(96, 'display'), fill='white')\nimg.save('out/poster.png')\nimg.size"}},
+        "example": {"action": "run", "arguments": {"code": "# Poster title\nfrom PIL import Image, ImageDraw\nimg = Image.open(wangp.path('visual:IMAGE')).convert('RGB')\nd = ImageDraw.Draw(img)\nd.text((60, 40), 'BLUE HOUR', font=wangp.font(96, 'display'), fill='white')\nimg.save('out/poster.png')\nimg.size"}},
     },
     "restart": {"description": "Restart the interpreter: in-memory variables are discarded, files in the sandbox are kept.", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
     "files": {
@@ -311,13 +311,14 @@ class PythonSandbox:
     code runs (the chat Stop button)."""
 
     def __init__(self, root: Path, *, resolve_path: Callable[[str], str], publish_media: Callable[[str, str], dict | None], publish_frames: Callable[[list[str], float, str, str], dict | None], virtualize: Callable[[str], str] = str, memory_mb: int = MEMORY_MB,
-                 call_tool: Callable[[str, dict], dict] | None = None, list_dir: Callable[[str], Path] | None = None, apps=None):
+                 call_tool: Callable[[str, dict], dict] | None = None, list_dir: Callable[[str], Path] | None = None, apps=None, resolve_part: Callable[[str], dict] | None = None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "out").mkdir(exist_ok=True)
         (self.root / "scratch").mkdir(exist_ok=True)  # the work folder the rules name in their examples
         self._low_integrity = sys.platform == "win32" and _label_low_integrity(self.root)
         self._resolve_path, self._publish_media, self._publish_frames, self._virtualize = resolve_path, publish_media, publish_frames, virtualize
+        self._resolve_part = resolve_part or (lambda reference: {"path": resolve_path(reference), "start_frame": 0, "end_frame": None})  # what wangp.video_frames reads, a view being a part of its source
         self.call_tool, self._list_dir = call_tool, list_dir  # call_tool(name, arguments) runs a WanGP tool for a script (Prime installs its own); list_dir(ref) resolves an authorized folder
         self.apps = apps  # shared.apps.dev.AppWorkshop when App Development is on: the app_* actions and wangp.app helpers
         self.progress: Callable[[str, dict], None] = lambda status_text, summary: None  # live status of a running script: a short status line and a summary dict for the transcript entry
@@ -466,6 +467,8 @@ class PythonSandbox:
                             raise FileNotFoundError(f"No such file: {reference}") from None
                         raise IsADirectoryError(f"{reference} is a folder: wangp.path is for files. List it with wangp.listdir({reference!r}); the sandbox's own files are relative paths here (scratch/a.png) and @documents/sandbox/scratch/a.png for other tools.") from None
                     raise
+            if request.get("op") == "part":
+                return {"value": self._resolve_part(str(request.get("ref", "")))}
             if request.get("op") == "video":
                 frames = [str(Path(frame).resolve()) for frame in request.get("frames", [])]
                 outside = [frame for frame in frames if not Path(frame).is_relative_to(self.root)]

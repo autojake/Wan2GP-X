@@ -18,6 +18,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mmgp import transfer
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import AttentionMixin
@@ -569,6 +570,7 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
         rope_theta: float = 100.0,
         rope_dim_ratio: float = 0.75,
         norm_eps: float = 1e-5,
+        rope_axes: int = 3,
     ) -> None:
         super().__init__()
         dim = num_attention_heads * attention_head_dim
@@ -576,11 +578,13 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
         self.patch_size_t = patch_size_t
         self.out_channels = out_channels
         self.num_register_tokens = num_register_tokens
+        self.rope_axes = rope_axes  # 2: MiniMax-H3-Image's decoder, (h, w) coordinates only
 
-        self.rope = MiniMaxH3VideoRotaryPosEmbed(int(attention_head_dim * rope_dim_ratio), theta=rope_theta)
+        self.rope = MiniMaxH3VideoRotaryPosEmbed(int(attention_head_dim * rope_dim_ratio), theta=rope_theta, num_axes=rope_axes)
         self.x_embedder = nn.Linear(in_channels, dim)
         self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
-        self.register_buffer("mask_token", torch.zeros(1, 1, dim))
+        if patch_size_t > 1:
+            self.register_buffer("mask_token", torch.zeros(1, 1, dim))
         self.transformer_blocks = nn.ModuleList(
             [
                 MiniMaxH3VideoTransformerBlock(
@@ -616,9 +620,13 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
             2.0 * (torch.arange(0.5, size, dtype=torch.float32, device=hidden_states.device) / size) - 1.0
             for size in (num_frames, height, width)
         ]
-        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, 2)
+        if self.rope_axes == 2:  # an image decoder: one frame, no time coordinate
+            grids = grids[1:]
+        elif self.patch_size_t == 1:  # a single-frame decoder keeps the time of the first latent of a 7-latent clip
+            grids[0] = torch.full((1,), 2.0 * (0.5 / 7) - 1.0, dtype=torch.float32, device=hidden_states.device)
+        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, len(grids) - 1)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1, -1)
-        suffix_ids = position_ids.new_zeros((batch_size, self.num_register_tokens + 1, 3))
+        suffix_ids = position_ids.new_zeros((batch_size, self.num_register_tokens + 1, self.rope_axes))
         position_ids = torch.cat([position_ids, suffix_ids], dim=1)
         rotary_emb = self.rope(position_ids)
 
@@ -696,6 +704,8 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         decoder_rope_theta: float = 100.0,
         decoder_rope_dim_ratio: float = 0.75,
         decoder_norm_eps: float = 1e-5,
+        decoder_patch_size_t: int | None = None,
+        decoder_rope_axes: int = 3,
         clip_length: int = 17,
         token_drop: int = 3,
         latents_mean: tuple[float, ...] = (0.0,) * 24,
@@ -723,7 +733,7 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
             in_channels=latent_channels,
             out_channels=out_channels,
             patch_size=self.spatial_compression_ratio,
-            patch_size_t=self.temporal_compression_ratio,
+            patch_size_t=decoder_patch_size_t or self.temporal_compression_ratio,
             num_layers=decoder_num_layers,
             num_attention_heads=decoder_num_attention_heads,
             attention_head_dim=decoder_attention_head_dim,
@@ -732,6 +742,7 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
             rope_theta=decoder_rope_theta,
             rope_dim_ratio=decoder_rope_dim_ratio,
             norm_eps=decoder_norm_eps,
+            rope_axes=decoder_rope_axes,
         )
 
         # Derived temporal-chunking geometry. `clip_length` pixel frames are encoded at a time; because
@@ -995,8 +1006,12 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         token_drop = self.config.token_drop
         temporal_ratio = self.temporal_compression_ratio
         chunk_num_frames = tokens_chunk_size * temporal_ratio
+        frame_pre_padding = self.frame_pre_padding
 
-        if z.shape[2] == 1:
+        if self.decoder.patch_size_t == 1:
+            # A single-frame decoder: one latent frame, one pixel frame.
+            num_chunks, output_frames, frame_pre_padding = 0, 1, 0
+        elif z.shape[2] == 1:
             # Fizgig H3 Still's decode recipe: five identical latents, then keep pixel frame 3.
             # https://github.com/shootthesound/ComfyUI-Fizgig-H3-Still (MIT)
             z = z.repeat(1, 1, tokens_chunk_size, 1, 1)
@@ -1034,13 +1049,13 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
                     part = self._prepare_decoded_chunk(chunk[:, :, start : min(start + 4, copy_frames)], uint8_rounding)
                     if decoded is None:
                         decoded = torch.empty(*part.shape[:2], output_frames, *part.shape[3:], dtype=part.dtype, device="cpu")
-                    decoded[:, :, write_position : write_position + part.shape[2]].copy_(part, non_blocking=False)
+                    transfer.copy_(decoded[:, :, write_position : write_position + part.shape[2]], part)
                     write_position += part.shape[2]
                     del part
 
             if num_chunks == 0:
                 # Short videos still need one decode, without an overlapping temporal chunk.
-                write_chunk(self._decode_clip(z)[:, :, self.frame_pre_padding : self.frame_pre_padding + output_frames])
+                write_chunk(self._decode_clip(z)[:, :, frame_pre_padding : frame_pre_padding + output_frames])
                 return decoded
 
             for i in range(num_chunks):

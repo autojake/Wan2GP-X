@@ -18,6 +18,7 @@ import os
 import tempfile
 import time
 from functools import lru_cache
+from mmgp import transfer
 from . import files_locator as fl
 from .video_decode import probe_video_stream_metadata, decode_video_frames_ffmpeg, get_video_summary_extras
 from .virtual_media import get_virtual_image, parse_virtual_media_path, strip_virtual_media_suffix
@@ -296,6 +297,14 @@ def get_video_info_details(video_path):
         }
     return _get_video_info_details_cached(video_path)
 
+def get_video_real_fps(video_path):
+    """A video's real frame rate, 23.976 and not the 24 of get_video_info, for what is counted in seconds: its audio, its recording."""
+    metadata = None if isinstance(video_path, Image.Image) else probe_video_stream_metadata(video_path)
+    if metadata is None or not metadata["fps_float"]:
+        return get_video_info(video_path)[0]
+    return int(round(metadata["fps_float"])) if abs(metadata["fps_float"] - round(metadata["fps_float"])) < 0.001 else metadata["fps_float"]
+
+
 def get_video_frame(file_name: str, frame_no: int, return_last_if_missing: bool = False, target_fps = None,  return_PIL = True) -> torch.Tensor:
     """Extract nth frame from video as PyTorch tensor normalized to [-1, 1]."""
     metadata = probe_video_stream_metadata(file_name)
@@ -459,7 +468,7 @@ def convert_video_tensor_to_uint8_chunked(video, value_range=(-1, 1), max_buffer
         work = buffer.narrow(time_dim, 0, size)
         work.copy_(video.narrow(time_dim, start, size))
         work.sub_(min_val).mul_(scale).clamp_(0, 255)
-        output.narrow(time_dim, start, size).copy_(work)
+        transfer.copy_(output.narrow(time_dim, start, size), work)  # (to RAM, without temporaries of the chunk)
     return output
 
 def save_image(tensor_image, name, frame_no = -1):
