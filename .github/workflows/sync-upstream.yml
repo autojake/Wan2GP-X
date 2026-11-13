@@ -27,10 +27,15 @@ jobs:
         run: |
           git remote add upstream https://github.com/deepbeepmeep/Wan2GP.git
           git fetch upstream
-          
-          # Force the 'upstream-main' branch to exactly match the author's main
-          # This keeps a clean, un-customized copy of their code in your repo
-          git push origin upstream/main:refs/heads/upstream-main --force
+
+          # Force 'upstream-main' to match upstream's main, excluding .github/workflows/
+          # because GITHUB_TOKEN cannot push workflow file changes.
+          git checkout -B upstream-main upstream/main
+          if [ -d .github/workflows ]; then
+            git rm -rf .github/workflows
+            git commit -m "chore: exclude upstream workflows from mirror"
+          fi
+          git push origin upstream-main --force
 
       - name: Merge Upstream into Main
         run: |
